@@ -7,6 +7,15 @@ standard `v00.00.00`; npm package versions remain SemVer.
 
 ## [Unreleased]
 
+## [v02.00.01] - 2026-04-29
+
+### Changed
+
+- Enforced npmjs.com package access as public after publish and added an unauthenticated registry visibility check before the release workflow can pass.
+- Aligned the repository funding metadata with the organization-wide Sponsors pattern and preserved that YAML style outside Prettier formatting.
+- Normalized `repository.url` to npm's canonical `git+https://...git` form.
+- Bumped the SDK package/runtime version to `2.0.1-alpha.0`.
+
 ## [v02.00.00] - 2026-04-29
 
 ### Added

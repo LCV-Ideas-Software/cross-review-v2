@@ -1,6 +1,6 @@
 {
   "name": "@lcv-ideas-software/cross-review-mcp-sdk",
-  "version": "2.0.0-alpha.3",
+  "version": "2.0.1-alpha.0",
   "description": "API/SDK-first MCP server for multi-model cross-review with unanimous convergence gates.",
   "type": "module",
   "main": "dist/src/mcp/server.js",
@@ -58,7 +58,7 @@
   "author": "LCV Ideas & Software",
   "repository": {
     "type": "git",
-    "url": "https://github.com/LCV-Ideas-Software/cross-review-mcp-sdk.git"
+    "url": "git+https://github.com/LCV-Ideas-Software/cross-review-mcp-sdk.git"
   },
   "bugs": {
     "url": "https://github.com/LCV-Ideas-Software/cross-review-mcp-sdk/issues"

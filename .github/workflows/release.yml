@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag/ref to release, for example v02.00.00"
+        description: "Tag/ref to release, for example v02.00.01"
         required: false
         default: ""
 
@@ -103,6 +103,39 @@ jobs:
         run: npm publish --access public --provenance --tag "${{ steps.meta.outputs.dist_tag }}"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Ensure npmjs.com package access is public
+        if: steps.meta.outputs.is_release == 'true'
+        run: npm access public "${{ steps.meta.outputs.name }}" --registry=https://registry.npmjs.org
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Verify npmjs.com public visibility
+        if: steps.meta.outputs.is_release == 'true'
+        env:
+          PACKAGE_NAME: ${{ steps.meta.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          REGISTRY_PATH="$(node -e "process.stdout.write(encodeURIComponent(process.env.PACKAGE_NAME))")"
+          URL="https://registry.npmjs.org/${REGISTRY_PATH}"
+          for attempt in {1..12}; do
+            if curl -fsS "$URL" | node -e '
+              let data = "";
+              process.stdin.on("data", (chunk) => { data += chunk; });
+              process.stdin.on("end", () => {
+                const pkg = JSON.parse(data);
+                process.exit(pkg.versions && pkg.versions[process.env.PACKAGE_VERSION] ? 0 : 1);
+              });
+            '; then
+              echo "${PACKAGE_NAME}@${PACKAGE_VERSION} is publicly visible on npmjs.com."
+              exit 0
+            fi
+            echo "npmjs.com visibility check attempt ${attempt}/12 failed; retrying."
+            sleep 10
+          done
+          echo "::error::${PACKAGE_NAME}@${PACKAGE_VERSION} is not publicly visible on npmjs.com after publish."
+          exit 1
 
       - name: Setup Node.js 24 for GitHub Packages
         if: steps.meta.outputs.is_release == 'true'

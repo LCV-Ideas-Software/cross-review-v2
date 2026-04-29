@@ -132,9 +132,9 @@ Secret redaction is applied when prompts, responses, evidence and JSON metadata 
 - GitHub Pages via Actions artifact deployment.
 - Dependabot configured.
 - Dependabot automerge workflow prepared.
-- Pushes to `main` auto-create an organization-standard display tag such as `v02.00.00` from `package.json`; the tag then creates a normal GitHub Release and publishes `@lcv-ideas-software/cross-review-mcp-sdk` to npmjs.com and GitHub Packages. Prerelease package versions use their prerelease label as the npm dist-tag, so `2.0.0-alpha.3` publishes as `alpha`, not `latest`.
+- Pushes to `main` auto-create an organization-standard display tag such as `v02.00.01` from `package.json`; the tag then creates a normal GitHub Release and publishes `@lcv-ideas-software/cross-review-mcp-sdk` to npmjs.com and GitHub Packages. Prerelease package versions use their prerelease label as the npm dist-tag, so `2.0.1-alpha.0` publishes as `alpha`, not `latest`.
 - CodeQL must be enabled through GitHub Default Setup after repository creation. Advanced Setup requires prior authorization.
 
 ## Status
 
-Version `v02.00.00` (npm package `2.0.0-alpha.3`) is an SDK-only alpha implementation. It is intentionally separate from the existing CLI-based `cross-review-mcp` and does not modify that repository.
+Version `v02.00.01` (npm package `2.0.1-alpha.0`) is an SDK-only alpha implementation. It is intentionally separate from the existing CLI-based `cross-review-mcp` and does not modify that repository.
