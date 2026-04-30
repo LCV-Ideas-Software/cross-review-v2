@@ -93,11 +93,11 @@ standard `v00.00.00`; npm package versions remain SemVer.
 ### Changed
 
 - Activated automatic tag creation from `package.json` version on pushes to `main`.
-- Activated GitHub release and package publishing for SDK tags under `@lcv-ideas-software/cross-review-mcp-sdk`, using prerelease npm dist-tags such as `alpha` so SDK alpha builds do not replace any stable `latest` channel.
+- Activated GitHub release and package publishing for the development package line, using prerelease npm dist-tags such as `alpha` so alpha builds do not replace any stable `latest` channel.
 - Aligned public version display and GitHub release tags with the organization `v00.00.00` standard while keeping npm SemVer for package publishing.
 - Added a `prepack` clean build so local runtime data cannot leak into npm artifacts through stale `dist/` output.
 - Hardened Git and npm ignore rules so `.env*`, `.tmp`/`tmp` and local runtime files are never published.
-- Pointed the SDK homepage, MCP metadata and Pages site at `cross-review-mcp-sdk.lcv.app.br`.
+- Pointed the development homepage, MCP metadata and Pages site at the temporary development domain.
 - Preserved the original expected quorum when a later recovery call reviews only a subset of peers.
 - Clarified peer response-format instructions so models do not treat the schema itself as the artifact under review.
 - Documented the distinction between MCP client request timeout and provider HTTP timeout.
