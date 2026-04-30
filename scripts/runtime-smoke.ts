@@ -49,6 +49,7 @@ try {
   const capabilities = await callTool("runtime_capabilities", { response_format: "json" });
   const roundStart = (await callTool("session_start_round", {
     task: "Runtime smoke: verify async review round.",
+    review_focus: "runtime/smoke",
     draft: "Runtime smoke draft.",
     peers: ["codex"],
     response_format: "json",
@@ -64,6 +65,7 @@ try {
   });
   const unanimousStart = (await callTool("session_start_unanimous", {
     task: "Runtime smoke: verify async unanimity flow.",
+    review_focus: "runtime/unanimous",
     lead_peer: "codex",
     peers: ["claude"],
     max_rounds: 2,

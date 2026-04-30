@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { AppConfig, PeerId } from "./types.js";
 
-export const VERSION = "2.2.0";
+export const VERSION = "2.3.0";
 export const RELEASE_DATE = "2026-04-30";
 export const DEFAULT_MAX_OUTPUT_TOKENS = 20_000;
 
@@ -133,6 +133,7 @@ export function loadConfig(): AppConfig {
     },
     prompt: {
       max_task_chars: intEnv("CROSS_REVIEW_V2_MAX_TASK_CHARS", 8_000),
+      max_review_focus_chars: intEnv("CROSS_REVIEW_V2_MAX_REVIEW_FOCUS_CHARS", 2_000),
       max_history_chars: intEnv("CROSS_REVIEW_V2_MAX_HISTORY_CHARS", 20_000),
       max_draft_chars: intEnv("CROSS_REVIEW_V2_MAX_DRAFT_CHARS", 40_000),
       max_prior_rounds: intEnv("CROSS_REVIEW_V2_MAX_PRIOR_ROUNDS", 5),

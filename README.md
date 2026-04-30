@@ -99,6 +99,8 @@ You can also set it as a Windows environment variable:
 
 Invalid, zero or negative values are ignored and the runtime falls back to `20000`.
 
+`CROSS_REVIEW_V2_MAX_REVIEW_FOCUS_CHARS` controls the maximum length of the optional `review_focus` prompt block. Default: `2000`.
+
 ## Token Streaming
 
 Token streaming is enabled by default. Provider progress is written to the session event stream as `peer.token.delta` events with character counts, followed by one `peer.token.completed` event per peer call. This lets MCP hosts, dashboards and future UIs show long-running work as it happens instead of waiting for the complete provider response.
@@ -197,6 +199,14 @@ Then open `http://127.0.0.1:4588`.
 - `session_sweep`
 - `session_finalize`
 
+## Review Focus
+
+Use optional `review_focus` when a broad review needs a stable scope anchor, for example `services/billing`, `src/core/session-store.ts`, or `release automation`.
+
+The field is available on `session_init`, `ask_peers`, `session_start_round`, `run_until_unanimous` and `session_start_unanimous`. Session-level focus is saved as `meta.review_focus`; per-call focus overrides it for that round or unanimous run. The runtime injects the value as a bounded/redacted Markdown `Review Focus` block into generation, review, revision and retry prompts. If an operator accidentally pastes a leading `/focus`, the prefix is stripped during normalization and only the plain scope text is forwarded.
+
+This is intentionally not Claude Code's `/focus` slash command. Official Claude Code docs describe `/focus` as a focus-mode UI toggle; Cross Review uses `review_focus` so the same instruction works for OpenAI/Codex, Anthropic/Claude, Gemini and DeepSeek.
+
 ## Session Observability
 
 Session metadata records in-flight rounds, convergence scope, convergence health, failed attempts, operator escalations, fallback events and attached evidence files. Each session can also produce `events.ndjson`, aggregate metrics and `session-report.md`, so long-running runs can be followed without waiting for a synchronous MCP call to return.
@@ -221,6 +231,6 @@ Secret redaction is applied when prompts, responses, evidence and JSON metadata 
 
 ## Status
 
-Current version: `v02.02.00` (npm package `2.2.0`).
+Current version: `v02.03.00` (npm package `2.3.0`).
 
 Version `v02.01.00` (npm package `2.1.0`) is the first stable release of `cross-review-v2`.

@@ -251,6 +251,7 @@ export interface SessionMeta {
   created_at: string;
   updated_at: string;
   task: string;
+  review_focus?: string;
   caller: PeerId | "operator";
   outcome?: SessionOutcome;
   outcome_reason?: string;
@@ -317,6 +318,7 @@ export interface AppConfig {
   };
   prompt: {
     max_task_chars: number;
+    max_review_focus_chars: number;
     max_history_chars: number;
     max_draft_chars: number;
     max_prior_rounds: number;

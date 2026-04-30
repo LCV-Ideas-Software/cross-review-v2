@@ -154,7 +154,12 @@ export class SessionStore {
     }
   }
 
-  init(task: string, caller: PeerId | "operator", snapshot: PeerProbeResult[]): SessionMeta {
+  init(
+    task: string,
+    caller: PeerId | "operator",
+    snapshot: PeerProbeResult[],
+    reviewFocus?: string,
+  ): SessionMeta {
     const session_id = crypto.randomUUID();
     const meta: SessionMeta = {
       session_id,
@@ -162,6 +167,7 @@ export class SessionStore {
       created_at: now(),
       updated_at: now(),
       task,
+      ...(reviewFocus ? { review_focus: reviewFocus } : {}),
       caller,
       capability_snapshot: snapshot,
       convergence_health: {
@@ -178,6 +184,13 @@ export class SessionStore {
     fs.mkdirSync(path.join(this.sessionDir(session_id), "agent-runs"), { recursive: true });
     writeJson(this.metaPath(session_id), meta);
     fs.writeFileSync(path.join(this.sessionDir(session_id), "task.md"), task, "utf8");
+    if (reviewFocus) {
+      fs.writeFileSync(
+        path.join(this.sessionDir(session_id), "review-focus.md"),
+        reviewFocus,
+        "utf8",
+      );
+    }
     return meta;
   }
 

@@ -23,12 +23,15 @@ for (const provider of ["OPENAI", "ANTHROPIC", "GEMINI", "DEEPSEEK"]) {
 }
 
 const previousMaxOutputTokens = process.env.CROSS_REVIEW_V2_MAX_OUTPUT_TOKENS;
+const previousMaxReviewFocusChars = process.env.CROSS_REVIEW_V2_MAX_REVIEW_FOCUS_CHARS;
 const previousStreamTokens = process.env.CROSS_REVIEW_V2_STREAM_TOKENS;
 const previousStreamText = process.env.CROSS_REVIEW_V2_STREAM_TEXT;
 process.env.CROSS_REVIEW_V2_MAX_OUTPUT_TOKENS = "32000";
 assert.equal(loadConfig().max_output_tokens, 32_000);
 process.env.CROSS_REVIEW_V2_MAX_OUTPUT_TOKENS = "not-a-number";
 assert.equal(loadConfig().max_output_tokens, 20_000);
+process.env.CROSS_REVIEW_V2_MAX_REVIEW_FOCUS_CHARS = "1234";
+assert.equal(loadConfig().prompt.max_review_focus_chars, 1_234);
 process.env.CROSS_REVIEW_V2_STREAM_TOKENS = "0";
 assert.equal(loadConfig().streaming.tokens, false);
 process.env.CROSS_REVIEW_V2_STREAM_TOKENS = "1";
@@ -41,6 +44,11 @@ if (previousMaxOutputTokens == null) {
   delete process.env.CROSS_REVIEW_V2_MAX_OUTPUT_TOKENS;
 } else {
   process.env.CROSS_REVIEW_V2_MAX_OUTPUT_TOKENS = previousMaxOutputTokens;
+}
+if (previousMaxReviewFocusChars == null) {
+  delete process.env.CROSS_REVIEW_V2_MAX_REVIEW_FOCUS_CHARS;
+} else {
+  process.env.CROSS_REVIEW_V2_MAX_REVIEW_FOCUS_CHARS = previousMaxReviewFocusChars;
 }
 if (previousStreamTokens == null) {
   delete process.env.CROSS_REVIEW_V2_STREAM_TOKENS;
@@ -275,12 +283,14 @@ assert.equal(
 
 const result = await orchestrator.runUntilUnanimous({
   task: "Escreva um paragrafo curto sobre validacao de software.",
+  review_focus: "services/billing",
   lead_peer: "codex",
   max_rounds: 2,
 });
 
 assert.equal(result.converged, true);
 assert.ok(result.session.session_id);
+assert.equal(result.session.review_focus, "services/billing");
 assert.equal(result.session.rounds.length, 1);
 assert.ok((result.session.generation_files?.length ?? 0) >= 1);
 assert.equal(result.session.in_flight, undefined);
@@ -290,6 +300,16 @@ assert.ok(events.includes("round.completed"));
 
 const finalPath = path.join(config.data_dir, "sessions", result.session.session_id, "final.md");
 assert.equal(fs.existsSync(finalPath), true);
+const reviewPromptPath = path.join(
+  config.data_dir,
+  "sessions",
+  result.session.session_id,
+  result.session.rounds[0]?.prompt_file ?? "",
+);
+const reviewPrompt = fs.readFileSync(reviewPromptPath, "utf8");
+assert.match(reviewPrompt, /## Review Focus/);
+assert.match(reviewPrompt, /services\/billing/);
+assert.doesNotMatch(reviewPrompt, /\/focus\s+services\/billing/);
 
 const evidence = orchestrator.store.attachEvidence(result.session.session_id, {
   label: "smoke evidence",
@@ -328,8 +348,35 @@ assert.equal(mismatch.converged, false);
 assert.equal(mismatch.round.rejected.at(-1)?.failure_class, "silent_model_downgrade");
 assert.equal(mismatch.session.failed_attempts?.at(-1)?.failure_class, "silent_model_downgrade");
 
+const focusSecret = ["sk", "test", "B".repeat(24)].join("-");
+const focusRedacted = await orchestrator.askPeers({
+  task: "Verify review focus redaction and bounding.",
+  review_focus: `/focus ${focusSecret} ${"x".repeat(2_500)}`,
+  draft: "This draft is intentionally simple.",
+  caller: "operator",
+  peers: ["codex"],
+});
+assert.match(focusRedacted.session.review_focus ?? "", /\[REDACTED\]/);
+assert.doesNotMatch(focusRedacted.session.review_focus ?? "", new RegExp(focusSecret));
+assert.equal(
+  (focusRedacted.session.review_focus ?? "").length <= config.prompt.max_review_focus_chars,
+  true,
+);
+const focusPromptPath = path.join(
+  config.data_dir,
+  "sessions",
+  focusRedacted.session.session_id,
+  focusRedacted.session.rounds[0]?.prompt_file ?? "",
+);
+const focusPrompt = fs.readFileSync(focusPromptPath, "utf8");
+assert.match(focusPrompt, /\[REDACTED\]/);
+assert.doesNotMatch(focusPrompt, new RegExp(focusSecret));
+assert.doesNotMatch(focusPrompt, /\/focus\s+/);
+assert.doesNotMatch(focusPrompt, new RegExp("x".repeat(2_100)));
+
 const formatRecovered = await orchestrator.askPeers({
   task: "Verify automatic parser format recovery.",
+  review_focus: "recovery/focus",
   draft: "FORCE_BAD_FORMAT",
   caller: "operator",
   peers: ["codex"],
@@ -341,9 +388,21 @@ assert.equal(
   true,
 );
 assert.equal(formatRecovered.round.peers[0]?.decision_quality, "recovered");
+const formatRecoveryPrompt = fs.readFileSync(
+  path.join(
+    config.data_dir,
+    "sessions",
+    formatRecovered.session.session_id,
+    formatRecovered.session.rounds[0]?.prompt_file ?? "",
+  ),
+  "utf8",
+);
+assert.match(formatRecoveryPrompt, /## Review Focus/);
+assert.match(formatRecoveryPrompt, /recovery\/focus/);
 
 const emptyDecisionRecovered = await orchestrator.askPeers({
   task: "Verify automatic full decision retry after empty peer output.",
+  review_focus: "recovery/focus",
   draft: "FORCE_EMPTY_REVIEW",
   caller: "operator",
   peers: ["codex"],
@@ -355,6 +414,17 @@ assert.equal(
   true,
 );
 assert.equal(emptyDecisionRecovered.round.peers[0]?.decision_quality, "recovered");
+const decisionRetryPrompt = fs.readFileSync(
+  path.join(
+    config.data_dir,
+    "sessions",
+    emptyDecisionRecovered.session.session_id,
+    emptyDecisionRecovered.session.rounds[0]?.prompt_file ?? "",
+  ),
+  "utf8",
+);
+assert.match(decisionRetryPrompt, /## Review Focus/);
+assert.match(decisionRetryPrompt, /recovery\/focus/);
 
 const formatRecoveryFailed = await orchestrator.askPeers({
   task: "Verify automatic parser format recovery failure handling.",

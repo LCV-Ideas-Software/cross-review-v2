@@ -15,6 +15,25 @@ standard `v00.00.00`; npm package versions remain SemVer.
   - removed the permanent `NPM_TOKEN` requirement from the npmjs.com publish step while preserving provenance.
 - Removed the legacy token-backed npmjs.com dist-tag normalization step; npmjs.com releases now rely on the trusted publishing `npm publish --tag` path only.
 
+## [v02.03.00] - 2026-04-30
+
+### Added
+
+- Added optional provider-neutral `review_focus` support to `session_init`, `ask_peers`, `session_start_round`, `run_until_unanimous` and `session_start_unanimous`.
+- Persisted session-level focus as `meta.review_focus` plus `review-focus.md`, and injected it into initial generation, review, revision, moderation-safe retry, format recovery and decision-retry prompts as a bounded/redacted `Review Focus` block that strips accidental leading `/focus` prefixes.
+- Added `CROSS_REVIEW_V2_MAX_REVIEW_FOCUS_CHARS` so operators can tune the focus anchor length without changing source code.
+
+### Changed
+
+- Incorporated the community `/focus` suggestion as a cross-provider scope anchor instead of a Claude-specific slash command. Official Claude Code docs describe `/focus` as a focus-mode UI toggle, so `cross-review-v2` now uses explicit prompt context that applies equally to OpenAI/Codex, Anthropic/Claude, Gemini and DeepSeek.
+- Promoted the release to minor because `review_focus` and `CROSS_REVIEW_V2_MAX_REVIEW_FOCUS_CHARS` expand the public MCP/configuration surface without breaking existing callers.
+
+### Validation
+
+- `npm run format:check`
+- `npm run lint`
+- `npm test` — includes runtime smoke, redaction/truncation checks for `review_focus`, accidental `/focus` prefix stripping, and retry-path coverage for format recovery and decision retry prompts.
+
 ## [v02.02.00] - 2026-04-30
 
 ### Added

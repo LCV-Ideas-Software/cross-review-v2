@@ -13,6 +13,15 @@ import { safeErrorMessage } from "../security/redact.js";
 
 const PeerSchema = z.enum(PEERS);
 const ResponseFormatSchema = z.enum(["json", "markdown"]).default("json");
+const ReviewFocusSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(4_000)
+  .describe(
+    "Optional provider-neutral review scope anchor. This is not Claude Code's /focus UI command; it is injected as a plain Review Focus prompt block for every selected peer.",
+  )
+  .optional();
 
 function textResult(value: unknown, responseFormat = "json") {
   const text =
@@ -268,6 +277,7 @@ export async function main(): Promise<void> {
       inputSchema: z
         .object({
           task: z.string().min(1).describe("Original task or artifact being reviewed."),
+          review_focus: ReviewFocusSchema,
           caller: z.union([PeerSchema, z.literal("operator")]).default("operator"),
           response_format: ResponseFormatSchema,
         })
@@ -279,8 +289,11 @@ export async function main(): Promise<void> {
         openWorldHint: true,
       },
     },
-    async ({ task, caller, response_format }) =>
-      textResult(await runtime.orchestrator.initSession(task, caller), response_format),
+    async ({ task, review_focus, caller, response_format }) =>
+      textResult(
+        await runtime.orchestrator.initSession(task, caller, review_focus),
+        response_format,
+      ),
   );
 
   server.registerTool(
@@ -331,6 +344,7 @@ export async function main(): Promise<void> {
         .object({
           session_id: z.string().uuid().optional(),
           task: z.string().min(1),
+          review_focus: ReviewFocusSchema,
           draft: z.string().min(1),
           caller: z.union([PeerSchema, z.literal("operator")]).default("operator"),
           caller_status: z.enum(["READY", "NOT_READY", "NEEDS_EVIDENCE"]).default("READY"),
@@ -363,6 +377,7 @@ export async function main(): Promise<void> {
         .object({
           session_id: z.string().uuid().optional(),
           task: z.string().min(1),
+          review_focus: ReviewFocusSchema,
           draft: z.string().min(1),
           caller: z.union([PeerSchema, z.literal("operator")]).default("operator"),
           caller_status: z.enum(["READY", "NOT_READY", "NEEDS_EVIDENCE"]).default("READY"),
@@ -384,7 +399,7 @@ export async function main(): Promise<void> {
     async ({ response_format, ...input }) => {
       const session = input.session_id
         ? runtime.orchestrator.store.read(input.session_id)
-        : await runtime.orchestrator.initSession(input.task, input.caller);
+        : await runtime.orchestrator.initSession(input.task, input.caller, input.review_focus);
       const job = startJob(runtime, "ask_peers", session.session_id, (signal) =>
         runtime.orchestrator.askPeers({ ...input, session_id: session.session_id, signal }),
       );
@@ -409,6 +424,7 @@ export async function main(): Promise<void> {
       inputSchema: z
         .object({
           task: z.string().min(1),
+          review_focus: ReviewFocusSchema,
           initial_draft: z.string().optional(),
           lead_peer: PeerSchema.default("codex"),
           peers: z
@@ -443,6 +459,7 @@ export async function main(): Promise<void> {
         .object({
           session_id: z.string().uuid().optional(),
           task: z.string().min(1),
+          review_focus: ReviewFocusSchema,
           initial_draft: z.string().optional(),
           lead_peer: PeerSchema.default("codex"),
           peers: z
@@ -466,7 +483,7 @@ export async function main(): Promise<void> {
     async ({ response_format, ...input }) => {
       const session = input.session_id
         ? runtime.orchestrator.store.read(input.session_id)
-        : await runtime.orchestrator.initSession(input.task, input.lead_peer);
+        : await runtime.orchestrator.initSession(input.task, input.lead_peer, input.review_focus);
       const job = startJob(runtime, "run_until_unanimous", session.session_id, (signal) =>
         runtime.orchestrator.runUntilUnanimous({
           ...input,

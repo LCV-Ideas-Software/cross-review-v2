@@ -26,6 +26,7 @@ import { redact } from "../security/redact.js";
 export interface AskPeersInput {
   session_id?: string;
   task: string;
+  review_focus?: string;
   draft: string;
   caller?: PeerId | "operator";
   caller_status?: ReviewStatus;
@@ -42,6 +43,7 @@ export interface AskPeersOutput {
 export interface RunUntilUnanimousInput {
   session_id?: string;
   task: string;
+  review_focus?: string;
   initial_draft?: string;
   lead_peer?: PeerId;
   peers?: PeerId[];
@@ -70,6 +72,29 @@ function safePromptText(value: string, maxLength = 4_000): string {
   const cleaned = redact(value).replace(/\r\n/g, "\n").trim();
   if (cleaned.length <= maxLength) return cleaned;
   return `${cleaned.slice(0, maxLength - 3)}...`;
+}
+
+function normalizeReviewFocus(value: string | undefined, config: AppConfig): string | undefined {
+  if (value == null) return undefined;
+  const neutralized = value.replace(/(^|\n)\s*\/focus\b\s*/gi, "$1");
+  const cleaned = safePromptText(neutralized, config.prompt.max_review_focus_chars);
+  return cleaned.length ? cleaned : undefined;
+}
+
+function reviewFocusBlock(
+  meta: SessionMeta | undefined,
+  config: AppConfig,
+  override?: string,
+): string[] {
+  const reviewFocus = normalizeReviewFocus(override ?? meta?.review_focus, config);
+  if (!reviewFocus) return [];
+  return [
+    "## Review Focus",
+    reviewFocus,
+    "",
+    "Treat this as the primary review anchor. Prioritize this area, but still report critical cross-cutting blockers if they invalidate the result.",
+    "",
+  ];
 }
 
 function safePromptList(values: string[] | undefined, maxItems = 8): string {
@@ -126,6 +151,7 @@ function buildModerationSafeReviewPrompt(
   meta: SessionMeta,
   draft: string,
   config: AppConfig,
+  reviewFocus?: string,
 ): string {
   return [
     "# Cross Review - Compact Moderation-Safe Review",
@@ -137,6 +163,7 @@ function buildModerationSafeReviewPrompt(
     "## Original Task (sanitized excerpt)",
     safePromptText(meta.task, Math.min(config.prompt.max_task_chars, 6_000)),
     "",
+    ...reviewFocusBlock(meta, config, reviewFocus),
     "## Recent History (structured summary only)",
     summarizePriorRounds(meta, config),
     "",
@@ -147,13 +174,19 @@ function buildModerationSafeReviewPrompt(
   ].join("\n");
 }
 
-function buildReviewPrompt(meta: SessionMeta, draft: string, config: AppConfig): string {
+function buildReviewPrompt(
+  meta: SessionMeta,
+  draft: string,
+  config: AppConfig,
+  reviewFocus?: string,
+): string {
   return [
     "# Cross Review - Review Round",
     "",
     "## Original Task",
     safePromptText(meta.task, config.prompt.max_task_chars),
     "",
+    ...reviewFocusBlock(meta, config, reviewFocus),
     "## Recent History",
     summarizePriorRounds(meta, config),
     "",
@@ -164,7 +197,12 @@ function buildReviewPrompt(meta: SessionMeta, draft: string, config: AppConfig):
   ].join("\n");
 }
 
-function buildRevisionPrompt(meta: SessionMeta, draft: string, config: AppConfig): string {
+function buildRevisionPrompt(
+  meta: SessionMeta,
+  draft: string,
+  config: AppConfig,
+  reviewFocus?: string,
+): string {
   return [
     "# Cross Review - Revision For Convergence",
     "",
@@ -174,6 +212,7 @@ function buildRevisionPrompt(meta: SessionMeta, draft: string, config: AppConfig
     "## Original Task",
     safePromptText(meta.task, config.prompt.max_task_chars),
     "",
+    ...reviewFocusBlock(meta, config, reviewFocus),
     "## Recent History",
     summarizePriorRounds(meta, config),
     "",
@@ -184,7 +223,7 @@ function buildRevisionPrompt(meta: SessionMeta, draft: string, config: AppConfig
   ].join("\n");
 }
 
-function buildInitialDraftPrompt(task: string, config: AppConfig): string {
+function buildInitialDraftPrompt(task: string, config: AppConfig, reviewFocus?: string): string {
   return [
     "# Cross Review - First Draft",
     "",
@@ -193,6 +232,8 @@ function buildInitialDraftPrompt(task: string, config: AppConfig): string {
     "",
     "## Task",
     safePromptText(task, config.prompt.max_task_chars),
+    "",
+    ...reviewFocusBlock(undefined, config, reviewFocus),
   ].join("\n");
 }
 
@@ -200,6 +241,7 @@ function buildFormatRecoveryPrompt(
   meta: SessionMeta,
   priorResponse: string,
   config: AppConfig,
+  reviewFocus?: string,
 ): string {
   const boundedTask = safePromptText(meta.task, Math.min(config.prompt.max_task_chars, 4_000));
   const boundedResponse =
@@ -216,6 +258,7 @@ function buildFormatRecoveryPrompt(
     "## Original Task",
     boundedTask,
     "",
+    ...reviewFocusBlock(meta, config, reviewFocus),
     "## Previous Unparseable Response",
     boundedResponse,
   ].join("\n");
@@ -226,6 +269,7 @@ function buildDecisionRetryPrompt(
   draft: string,
   priorResponse: string,
   config: AppConfig,
+  reviewFocus?: string,
 ): string {
   return [
     "# Cross Review - Decision Retry",
@@ -237,6 +281,7 @@ function buildDecisionRetryPrompt(
     "## Original Task",
     safePromptText(meta.task, Math.min(config.prompt.max_task_chars, 4_000)),
     "",
+    ...reviewFocusBlock(meta, config, reviewFocus),
     "## Recent History",
     summarizePriorRounds(meta, config),
     "",
@@ -416,14 +461,19 @@ export class CrossReviewOrchestrator {
     return Promise.all(selectAdapters(adapters).map((adapter) => adapter.probe()));
   }
 
-  async initSession(task: string, caller: PeerId | "operator" = "operator"): Promise<SessionMeta> {
+  async initSession(
+    task: string,
+    caller: PeerId | "operator" = "operator",
+    reviewFocus?: string,
+  ): Promise<SessionMeta> {
     const snapshot = await this.probeAll();
-    const meta = this.store.init(task, caller, snapshot);
+    const normalizedReviewFocus = normalizeReviewFocus(reviewFocus, this.config);
+    const meta = this.store.init(task, caller, snapshot, normalizedReviewFocus);
     this.emit({
       type: "session.created",
       session_id: meta.session_id,
       message: "Session created.",
-      data: { caller },
+      data: { caller, review_focus: Boolean(normalizedReviewFocus) },
     });
     return meta;
   }
@@ -611,7 +661,7 @@ export class CrossReviewOrchestrator {
     const callerStatus = input.caller_status ?? "READY";
     const session = input.session_id
       ? this.store.read(input.session_id)
-      : await this.initSession(input.task, caller);
+      : await this.initSession(input.task, caller, input.review_focus);
     const roundNumber = session.rounds.length + 1;
     const startedAt = now();
     const selectedPeers = uniquePeers(input.peers?.length ? input.peers : [...PEERS]);
@@ -626,8 +676,13 @@ export class CrossReviewOrchestrator {
       lead_peer: caller === "operator" ? undefined : caller,
     };
     const draftFile = this.store.saveDraft(session.session_id, roundNumber, input.draft);
-    const prompt = buildReviewPrompt(session, input.draft, this.config);
-    const moderationSafePrompt = buildModerationSafeReviewPrompt(session, input.draft, this.config);
+    const prompt = buildReviewPrompt(session, input.draft, this.config, input.review_focus);
+    const moderationSafePrompt = buildModerationSafeReviewPrompt(
+      session,
+      input.draft,
+      this.config,
+      input.review_focus,
+    );
     const promptFile = this.store.savePrompt(session.session_id, roundNumber, prompt);
     this.store.markInFlight(session.session_id, {
       round: roundNumber,
@@ -765,8 +820,19 @@ export class CrossReviewOrchestrator {
           try {
             const recovered = await adapter.call(
               decisionRetry
-                ? buildDecisionRetryPrompt(session, input.draft, peerResult.text, this.config)
-                : buildFormatRecoveryPrompt(session, peerResult.text, this.config),
+                ? buildDecisionRetryPrompt(
+                    session,
+                    input.draft,
+                    peerResult.text,
+                    this.config,
+                    input.review_focus,
+                  )
+                : buildFormatRecoveryPrompt(
+                    session,
+                    peerResult.text,
+                    this.config,
+                    input.review_focus,
+                  ),
               {
                 session_id: session.session_id,
                 round: roundNumber,
@@ -890,7 +956,7 @@ export class CrossReviewOrchestrator {
     const selectedPeers = input.peers?.length ? input.peers : [...PEERS];
     let session = input.session_id
       ? this.store.read(input.session_id)
-      : await this.initSession(input.task, leadPeer);
+      : await this.initSession(input.task, leadPeer, input.review_focus);
     const adapters = createAdapters(this.config);
     const reviewerPeers = selectedPeers.filter((peer) => peer !== leadPeer);
     let draft = input.initial_draft;
@@ -924,7 +990,7 @@ export class CrossReviewOrchestrator {
         };
       }
       const generation = await adapters[leadPeer].generate(
-        buildInitialDraftPrompt(input.task, this.config),
+        buildInitialDraftPrompt(input.task, this.config, input.review_focus),
         {
           session_id: session.session_id,
           round: 0,
@@ -956,6 +1022,7 @@ export class CrossReviewOrchestrator {
         caller: leadPeer,
         caller_status: "READY",
         peers: reviewerPeers.length ? reviewerPeers : selectedPeers,
+        review_focus: input.review_focus,
         signal: input.signal,
       });
       session = this.store.read(session.session_id);
@@ -980,7 +1047,7 @@ export class CrossReviewOrchestrator {
 
       if (round < maxRounds) {
         const generation = await adapters[leadPeer].generate(
-          buildRevisionPrompt(session, draft, this.config),
+          buildRevisionPrompt(session, draft, this.config, input.review_focus),
           {
             session_id: session.session_id,
             round,
