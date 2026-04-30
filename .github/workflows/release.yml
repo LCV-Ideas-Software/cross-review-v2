@@ -97,9 +97,31 @@ jobs:
             echo "${{ steps.meta.outputs.name }}@${{ steps.meta.outputs.version }} is not published on npmjs.com yet."
           fi
 
+      - name: Verify npm Trusted Publishing toolchain
+        if: steps.meta.outputs.is_release == 'true' && steps.npmjs-version.outputs.exists != 'true'
+        run: |
+          set -euo pipefail
+          echo "Node.js $(node --version)"
+          NPM_VERSION="$(npm --version)"
+          echo "npm ${NPM_VERSION}"
+          node -e '
+            const version = process.argv[1];
+            const [major = 0, minor = 0, patch = 0] = version.split(".").map(Number);
+            const ok = major > 11 || (major === 11 && (minor > 5 || (minor === 5 && patch >= 1)));
+            if (!ok) {
+              console.error(`npm ${version} is too old for npm Trusted Publishing; require >=11.5.1.`);
+              process.exit(1);
+            }
+          ' "$NPM_VERSION"
+
       - name: Publish to npmjs.com
         if: steps.meta.outputs.is_release == 'true' && steps.npmjs-version.outputs.exists != 'true'
-        run: npm publish --access public --provenance --tag "${{ steps.meta.outputs.dist_tag }}"
+        run: |
+          # npm Trusted Publishing authenticates this workflow with OIDC and
+          # generates provenance automatically. Avoid long-lived npm tokens
+          # and keep the publish command on the documented OIDC path.
+          unset NODE_AUTH_TOKEN
+          npm publish --access public --tag "${{ steps.meta.outputs.dist_tag }}"
 
       - name: Verify npmjs.com public visibility
         if: steps.meta.outputs.is_release == 'true'
