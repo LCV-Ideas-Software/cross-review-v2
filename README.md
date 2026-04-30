@@ -14,18 +14,19 @@
 
 **Install.** `npm install -g @lcv-ideas-software/cross-review-v2` (npmjs.com) or `npm install -g @lcv-ideas-software/cross-review-v2 --registry=https://npm.pkg.github.com` (GitHub Packages mirror).
 
-**Status.** Stable. Current release: **v02.03.01** (npm package `2.3.1`) paired with an API-first stable public surface. See [CHANGELOG.md](./CHANGELOG.md) for the release history. v2.x releases use the organization display-tag standard (`v00.00.00`) while npm packages keep SemVer (`2.x.y`). The stable public rename from the temporary development name was completed at **v02.01.00** / npm package `2.1.0`, and all active docs, package metadata, publishing workflows, and runtime identity now use `cross-review-v2`.
+**Status.** Stable. Current release: **v02.03.02** (npm package `2.3.2`) paired with an API-first stable public surface. See [CHANGELOG.md](./CHANGELOG.md) for the release history. v2.x releases use the organization display-tag standard (`v00.00.00`) while npm packages keep SemVer (`2.x.y`). The stable public rename from the temporary development name was completed at **v02.01.00** / npm package `2.1.0`, and all active docs, package metadata, publishing workflows, and runtime identity now use `cross-review-v2`.
 
 The version history at a glance:
 
-| Release | Scope |
-|---|---|
-| **`v02.03.01`** | **README organizational standardization.** Harmonized the public README opening with the shared organizational pattern, preserving the API-first operational sections while aligning badges, status framing, and version-history presentation. |
+| Release         | Scope                                                                                                                                                                                                                                                                                   |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`v02.03.02`** | **README/metadata release hygiene.** Reissued the README organizational standardization after Prettier formatting and active-document rename cleanup, keeping the latest release green end-to-end.                                                                                      |
+| **`v02.03.01`** | **README organizational standardization.** Harmonized the public README opening with the shared organizational pattern, preserving the API-first operational sections while aligning badges, status framing, and version-history presentation.                                          |
 | **`v02.03.00`** | **Review focus tightening.** Added provider-neutral `review_focus` across the main orchestration tools, front-loaded it in prompts, stripped accidental `/focus` prefixes, and introduced explicit `OUT OF SCOPE` guidance so reviewers stay anchored without hiding critical blockers. |
-| **`v02.02.00`** | **Live token streaming.** Added real provider token streaming, count-based progress events, `CROSS_REVIEW_V2_STREAM_TOKENS`, optional redacted streamed text for trusted diagnostics, and a real API streaming smoke. |
-| **`v02.01.01`** | **Hardening and advanced-model enforcement.** Closed CodeQL issues in redaction/logging, added decision-retry recovery, standardized `CROSS_REVIEW_V2_MAX_OUTPUT_TOKENS`, removed weak/deprecated model fallbacks, and enforced advanced thinking-capable peer selection. |
-| **`v02.01.00`** | **First stable release as cross-review-v2.** Promoted the API-first implementation to stable, added cancellation, restart recovery, metrics, runtime capabilities, fallback events, and completed the public rename to `cross-review-v2`. |
-| **`v2.0.x`** | **Foundation hardening before stability.** The pre-stable `v02.00.xx` line built the durable session model, dashboard/reporting surface, provider adapters, retry behavior, and release/publishing baseline that enabled the stable cut. |
+| **`v02.02.00`** | **Live token streaming.** Added real provider token streaming, count-based progress events, `CROSS_REVIEW_V2_STREAM_TOKENS`, optional redacted streamed text for trusted diagnostics, and a real API streaming smoke.                                                                   |
+| **`v02.01.01`** | **Hardening and advanced-model enforcement.** Closed CodeQL issues in redaction/logging, added decision-retry recovery, standardized `CROSS_REVIEW_V2_MAX_OUTPUT_TOKENS`, removed weak/deprecated model fallbacks, and enforced advanced thinking-capable peer selection.               |
+| **`v02.01.00`** | **First stable release as cross-review-v2.** Promoted the API-first implementation to stable, added cancellation, restart recovery, metrics, runtime capabilities, fallback events, and completed the public rename to `cross-review-v2`.                                               |
+| **`v2.0.x`**    | **Foundation hardening before stability.** The pre-stable `v02.00.xx` line built the durable session model, dashboard/reporting surface, provider adapters, retry behavior, and release/publishing baseline that enabled the stable cut.                                                |
 
 ## What It Does
 
@@ -44,12 +45,12 @@ Runtime calls are real provider calls by default. Stubs exist only for smoke tes
 
 ## Peers and Transport
 
-| Peer | Transport | Notes |
-|---|---|---|
-| `codex` | OpenAI API via official client library | Advanced reasoning model selection with explicit reasoning effort controls. |
-| `claude` | Anthropic API via official TypeScript SDK | Advanced Opus-class selection with adaptive thinking. |
-| `gemini` | Google Gen AI SDK | Advanced Gemini 3.1 Pro preview selection with thinking-capable preference. |
-| `deepseek` | DeepSeek OpenAI-compatible API via OpenAI client library | Advanced `deepseek-v4-pro` selection with reasoning effort controls. |
+| Peer       | Transport                                                | Notes                                                                       |
+| ---------- | -------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `codex`    | OpenAI API via official client library                   | Advanced reasoning model selection with explicit reasoning effort controls. |
+| `claude`   | Anthropic API via official TypeScript SDK                | Advanced Opus-class selection with adaptive thinking.                       |
+| `gemini`   | Google Gen AI SDK                                        | Advanced Gemini 3.1 Pro preview selection with thinking-capable preference. |
+| `deepseek` | DeepSeek OpenAI-compatible API via OpenAI client library | Advanced `deepseek-v4-pro` selection with reasoning effort controls.        |
 
 ## Rename Notice
 
@@ -262,7 +263,7 @@ Secret redaction is applied when prompts, responses, evidence and JSON metadata 
 
 ## Status
 
-Current version: `v02.03.01` (npm package `2.3.1`).
+Current version: `v02.03.02` (npm package `2.3.2`).
 
 Version `v02.01.00` (npm package `2.1.0`) is the first stable release of `cross-review-v2`.
 
