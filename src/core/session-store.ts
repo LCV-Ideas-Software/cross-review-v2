@@ -21,6 +21,8 @@ import type {
 import { mergeCost, mergeUsage } from "./cost.js";
 import { redact } from "../security/redact.js";
 
+export const SWEEP_MIN_IDLE_MS = 24 * 60 * 60 * 1000;
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -632,13 +634,14 @@ export class SessionStore {
     outcome: "aborted" | "max-rounds" = "aborted",
     reason = "stale",
   ): SessionMeta[] {
+    const effectiveIdleMs = Math.max(idleMs, SWEEP_MIN_IDLE_MS);
     const nowMs = Date.now();
     const swept: SessionMeta[] = [];
     for (const session of this.list()) {
       if (session.outcome) continue;
       const updatedAt = Date.parse(session.updated_at);
       const idleFor = Number.isFinite(updatedAt) ? nowMs - updatedAt : Infinity;
-      if (idleFor < idleMs) continue;
+      if (idleFor < effectiveIdleMs) continue;
       const finalized = this.withSessionLock(session.session_id, () => {
         const current = this.read(session.session_id);
         current.outcome = outcome;

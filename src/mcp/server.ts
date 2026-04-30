@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { RELEASE_DATE, VERSION, loadConfig } from "../core/config.js";
+import { RELEASE_DATE, VERSION, loadConfig, missingFinancialControlVars } from "../core/config.js";
 import { CrossReviewOrchestrator } from "../core/orchestrator.js";
 import { PEERS } from "../core/types.js";
 import type { PeerId, RuntimeCapabilities, RuntimeEvent } from "../core/types.js";
@@ -13,6 +13,12 @@ import { safeErrorMessage } from "../security/redact.js";
 
 const PeerSchema = z.enum(PEERS);
 const ResponseFormatSchema = z.enum(["json", "markdown"]).default("json");
+export const SessionIdSchema = z
+  .string()
+  .regex(
+    /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i,
+    "session_id must be a valid UUIDv4",
+  );
 const ReviewFocusSchema = z
   .string()
   .trim()
@@ -32,7 +38,7 @@ function textResult(value: unknown, responseFormat = "json") {
 }
 
 type JobKind = "ask_peers" | "run_until_unanimous";
-type JobStatus = {
+export type JobStatus = {
   job_id: string;
   kind: JobKind;
   session_id: string;
@@ -68,6 +74,15 @@ function now(): string {
   return new Date().toISOString();
 }
 
+export function pruneCompletedJobs(jobs: Map<string, JobStatus>, maxCompleted = 500): void {
+  const completed = [...jobs.values()]
+    .filter((job) => job.status !== "running")
+    .sort((a, b) => (a.completed_at ?? "").localeCompare(b.completed_at ?? ""));
+  for (const job of completed.slice(0, Math.max(0, completed.length - maxCompleted))) {
+    jobs.delete(job.job_id);
+  }
+}
+
 function summarizeJobResult(result: unknown): Record<string, unknown> {
   if (result && typeof result === "object" && "session" in result) {
     const session = (result as { session?: { session_id?: string; outcome?: string } }).session;
@@ -96,6 +111,7 @@ function startJob(
     started_at: now(),
   };
   runtime.jobs.set(job.job_id, job);
+  pruneCompletedJobs(runtime.jobs);
   runtime.controllers.set(job.job_id, controller);
   void run(controller.signal)
     .then((result) => {
@@ -213,6 +229,17 @@ export async function main(): Promise<void> {
           stub: runtime.config.stub,
           retry_timeout_ms: runtime.config.retry.timeout_ms,
           budget: runtime.config.budget,
+          financial_controls: {
+            paid_calls_ready:
+              missingFinancialControlVars(runtime.config, [...PEERS], {
+                untilStopped: true,
+              }).length === 0,
+            missing_variables: missingFinancialControlVars(runtime.config, [...PEERS], {
+              untilStopped: true,
+            }),
+            policy:
+              "Paid provider calls are blocked until budget ceilings and per-peer USD-per-million rate cards are explicitly configured.",
+          },
           prompt: runtime.config.prompt,
           max_output_tokens: runtime.config.max_output_tokens,
           streaming: runtime.config.streaming,
@@ -319,7 +346,7 @@ export async function main(): Promise<void> {
       description: "Read a durable session meta.json by session_id.",
       inputSchema: z
         .object({
-          session_id: z.string().uuid(),
+          session_id: SessionIdSchema,
           response_format: ResponseFormatSchema,
         })
         .strict(),
@@ -342,7 +369,7 @@ export async function main(): Promise<void> {
         "Run a real API review round against selected peers. Runtime default uses real provider APIs; stubs run only when CROSS_REVIEW_V2_STUB=1.",
       inputSchema: z
         .object({
-          session_id: z.string().uuid().optional(),
+          session_id: SessionIdSchema.optional(),
           task: z.string().min(1),
           review_focus: ReviewFocusSchema,
           draft: z.string().min(1),
@@ -375,7 +402,7 @@ export async function main(): Promise<void> {
         "Start a real peer-review round in the background and return immediately with a session_id/job_id for polling.",
       inputSchema: z
         .object({
-          session_id: z.string().uuid().optional(),
+          session_id: SessionIdSchema.optional(),
           task: z.string().min(1),
           review_focus: ReviewFocusSchema,
           draft: z.string().min(1),
@@ -457,7 +484,7 @@ export async function main(): Promise<void> {
         "Start real API generation/revision rounds in the background until unanimity, max_rounds or budget limit.",
       inputSchema: z
         .object({
-          session_id: z.string().uuid().optional(),
+          session_id: SessionIdSchema.optional(),
           task: z.string().min(1),
           review_focus: ReviewFocusSchema,
           initial_draft: z.string().optional(),
@@ -511,8 +538,8 @@ export async function main(): Promise<void> {
         "Request cancellation for running background jobs in a durable session. Provider calls receive AbortSignal where the provider client supports it.",
       inputSchema: z
         .object({
-          session_id: z.string().uuid(),
-          job_id: z.string().uuid().optional(),
+          session_id: SessionIdSchema,
+          job_id: SessionIdSchema.optional(),
           reason: z.string().min(1).max(300).default("operator_requested"),
           response_format: ResponseFormatSchema,
         })
@@ -587,7 +614,7 @@ export async function main(): Promise<void> {
         "Return durable session state and background job status without waiting for provider calls to finish.",
       inputSchema: z
         .object({
-          session_id: z.string().uuid(),
+          session_id: SessionIdSchema,
           response_format: ResponseFormatSchema,
         })
         .strict(),
@@ -625,7 +652,7 @@ export async function main(): Promise<void> {
         "Return aggregate observability metrics across all sessions, or only one session when session_id is provided.",
       inputSchema: z
         .object({
-          session_id: z.string().uuid().optional(),
+          session_id: SessionIdSchema.optional(),
           response_format: ResponseFormatSchema,
         })
         .strict(),
@@ -648,7 +675,7 @@ export async function main(): Promise<void> {
         "Read durable session events from events.ndjson. Use since_seq to incrementally poll long-running sessions.",
       inputSchema: z
         .object({
-          session_id: z.string().uuid(),
+          session_id: SessionIdSchema,
           since_seq: z.number().int().min(0).default(0),
           response_format: ResponseFormatSchema,
         })
@@ -678,7 +705,7 @@ export async function main(): Promise<void> {
         "Generate and save a Markdown report with convergence, peer decisions, failures, costs and latest events.",
       inputSchema: z
         .object({
-          session_id: z.string().uuid(),
+          session_id: SessionIdSchema,
           response_format: ResponseFormatSchema,
         })
         .strict(),
@@ -710,7 +737,7 @@ export async function main(): Promise<void> {
         "Return the latest durable convergence state, health and scope for a saved session without calling providers.",
       inputSchema: z
         .object({
-          session_id: z.string().uuid(),
+          session_id: SessionIdSchema,
           response_format: ResponseFormatSchema,
         })
         .strict(),
@@ -748,7 +775,7 @@ export async function main(): Promise<void> {
         "Persist a text evidence artifact under a durable session evidence directory and register it in session metadata.",
       inputSchema: z
         .object({
-          session_id: z.string().uuid(),
+          session_id: SessionIdSchema,
           label: z.string().min(1).max(120),
           content: z.string().min(1).max(2_000_000),
           content_type: z.string().min(1).max(120).default("text/plain"),
@@ -783,7 +810,7 @@ export async function main(): Promise<void> {
         "Record a durable operator escalation for sessions that require human judgment or external intervention.",
       inputSchema: z
         .object({
-          session_id: z.string().uuid(),
+          session_id: SessionIdSchema,
           reason: z.string().min(1).max(1000),
           severity: z.enum(["info", "warning", "critical"]).default("warning"),
           response_format: ResponseFormatSchema,
@@ -808,10 +835,10 @@ export async function main(): Promise<void> {
     {
       title: "Sweep Idle Sessions",
       description:
-        "Finalize unfinished sessions whose metadata has been idle for the requested number of minutes.",
+        "Finalize unfinished sessions whose metadata has been idle for at least 24 hours.",
       inputSchema: z
         .object({
-          idle_minutes: z.number().min(0).max(100_000).default(60),
+          idle_minutes: z.number().min(1440).max(100_000).default(1440),
           outcome: z.enum(["aborted", "max-rounds"]).default("aborted"),
           reason: z.string().min(1).max(200).default("stale"),
           response_format: ResponseFormatSchema,
@@ -839,7 +866,7 @@ export async function main(): Promise<void> {
         "Mark a durable session as converged, aborted or max-rounds with an optional reason.",
       inputSchema: z
         .object({
-          session_id: z.string().uuid(),
+          session_id: SessionIdSchema,
           outcome: z.enum(["converged", "aborted", "max-rounds"]),
           reason: z.string().max(200).optional(),
           response_format: ResponseFormatSchema,

@@ -9,6 +9,20 @@ standard `v00.00.00`; npm package versions remain SemVer.
 
 _No entries yet._
 
+## [v02.03.03] - 2026-04-30
+
+### Fixed
+
+- `review_focus` is now wrapped in escaped `<review_focus>...</review_focus>` delimiters before prompt injection. The block explicitly states that tagged content is operator-provided scope data, not instructions that can override protocol, schemas, safety rules or task directives. This operationalizes the Gemini/Antigravity "Prompt Shielding" recommendation while keeping parity with `cross-review-v1`.
+- Paid provider calls are now blocked until explicit financial controls are configured: session ceiling, preflight round ceiling, `until_stopped` ceiling when applicable, and per-peer USD-per-million input/output rate cards. Missing financial variables return `financial_controls_missing` before provider calls instead of relying on hard-coded cost fallbacks.
+- `server_info` now reports `financial_controls.paid_calls_ready`, the missing financial variables, and the active policy so operators can diagnose cost-configuration blockers before starting a paid run.
+- Hardened the MCP surface with UUIDv4-only session/job schemas, a 24-hour minimum idle floor for `session_sweep`, completed-job pruning, and `peer.format_recovery.cost_alert` events before automatic format-recovery or decision-retry calls.
+
+### Validation
+
+- `npm run format:check`
+- `npm test` — covers `<review_focus>` tags, escaped attempted `</review_focus>` injection, redaction, bounding, the existing `OUT OF SCOPE` clause, UUIDv4-only session/job schemas, missing financial-control blocking, the configurable `until_stopped` cost ceiling, the 24-hour sweep floor, completed-job pruning, and format-recovery cost alerts.
+
 ## [v02.03.02] - 2026-04-30
 
 ### Fixed

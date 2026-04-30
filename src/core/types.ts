@@ -313,6 +313,7 @@ export interface AppConfig {
   };
   budget: {
     max_session_cost_usd?: number;
+    until_stopped_max_cost_usd?: number;
     preflight_max_round_cost_usd?: number;
     require_rates_for_budget: boolean;
   };

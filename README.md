@@ -14,12 +14,13 @@
 
 **Install.** `npm install -g @lcv-ideas-software/cross-review-v2` (npmjs.com) or `npm install -g @lcv-ideas-software/cross-review-v2 --registry=https://npm.pkg.github.com` (GitHub Packages mirror).
 
-**Status.** Stable. Current release: **v02.03.02** (npm package `2.3.2`) paired with an API-first stable public surface. See [CHANGELOG.md](./CHANGELOG.md) for the release history. v2.x releases use the organization display-tag standard (`v00.00.00`) while npm packages keep SemVer (`2.x.y`). The stable public rename from the temporary development name was completed at **v02.01.00** / npm package `2.1.0`, and all active docs, package metadata, publishing workflows, and runtime identity now use `cross-review-v2`.
+**Status.** Stable. Current release: **v02.03.03** (npm package `2.3.3`) paired with an API-first stable public surface. See [CHANGELOG.md](./CHANGELOG.md) for the release history. v2.x releases use the organization display-tag standard (`v00.00.00`) while npm packages keep SemVer (`2.x.y`). The stable public rename from the temporary development name was completed at **v02.01.00** / npm package `2.1.0`, and all active docs, package metadata, publishing workflows, and runtime identity now use `cross-review-v2`.
 
 The version history at a glance:
 
 | Release         | Scope                                                                                                                                                                                                                                                                                   |
 | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`v02.03.03`** | **Review focus shielding and FinOps gates.** The front-loaded `review_focus` block is now wrapped in escaped `<review_focus>...</review_focus>` tags, and paid API calls are blocked until explicit cost ceilings and per-peer rate cards are configured.                               |
 | **`v02.03.02`** | **README/metadata release hygiene.** Reissued the README organizational standardization after Prettier formatting and active-document rename cleanup, keeping the latest release green end-to-end.                                                                                      |
 | **`v02.03.01`** | **README organizational standardization.** Harmonized the public README opening with the shared organizational pattern, preserving the API-first operational sections while aligning badges, status framing, and version-history presentation.                                          |
 | **`v02.03.00`** | **Review focus tightening.** Added provider-neutral `review_focus` across the main orchestration tools, front-loaded it in prompts, stripped accidental `/focus` prefixes, and introduced explicit `OUT OF SCOPE` guidance so reviewers stay anchored without hiding critical blockers. |
@@ -131,6 +132,87 @@ Invalid, zero or negative values are ignored and the runtime falls back to `2000
 
 `CROSS_REVIEW_V2_MAX_REVIEW_FOCUS_CHARS` controls the maximum length of the optional `review_focus` prompt block. Default: `2000`.
 
+## Financial Controls
+
+Cost controls are mandatory for real provider calls. `cross-review-v2` does not hard-code provider prices or financial fallback limits, because model pricing changes outside this repository and each operator has a different budget tolerance. If any required cost variable is missing, paid tools such as `ask_peers`, `run_until_unanimous`, `session_start_round` and `session_start_unanimous` stop before calling provider APIs and return a clear `financial_controls_missing` diagnostic listing the missing variables.
+
+These settings have two jobs:
+
+- **Budget ceilings** define how much one session or one round is allowed to cost before the run is blocked or stopped.
+- **Rate cards** tell the runtime how to estimate provider cost from input/output token usage.
+
+Without both, the server cannot honestly enforce a budget, so it refuses to spend API credits.
+
+Required budget ceilings:
+
+- `CROSS_REVIEW_V2_MAX_SESSION_COST_USD`: maximum estimated cost for one complete session. This is the main safety ceiling.
+- `CROSS_REVIEW_V2_PREFLIGHT_MAX_ROUND_COST_USD`: maximum estimated cost for a single round before that round starts. This prevents an unexpectedly large prompt from starting an expensive fan-out.
+- `CROSS_REVIEW_V2_UNTIL_STOPPED_MAX_COST_USD`: required ceiling for `until_stopped=true` runs. This exists because open-ended unanimity loops must still have a financial stop condition.
+
+Required rate cards, in USD per million tokens:
+
+- `CROSS_REVIEW_OPENAI_INPUT_USD_PER_MILLION`
+- `CROSS_REVIEW_OPENAI_OUTPUT_USD_PER_MILLION`
+- `CROSS_REVIEW_ANTHROPIC_INPUT_USD_PER_MILLION`
+- `CROSS_REVIEW_ANTHROPIC_OUTPUT_USD_PER_MILLION`
+- `CROSS_REVIEW_GEMINI_INPUT_USD_PER_MILLION`
+- `CROSS_REVIEW_GEMINI_OUTPUT_USD_PER_MILLION`
+- `CROSS_REVIEW_DEEPSEEK_INPUT_USD_PER_MILLION`
+- `CROSS_REVIEW_DEEPSEEK_OUTPUT_USD_PER_MILLION`
+
+Example with the local budget ceiling preferred by this workspace:
+
+```powershell
+[Environment]::SetEnvironmentVariable("CROSS_REVIEW_V2_MAX_SESSION_COST_USD", "20", "User")
+[Environment]::SetEnvironmentVariable("CROSS_REVIEW_V2_PREFLIGHT_MAX_ROUND_COST_USD", "20", "User")
+[Environment]::SetEnvironmentVariable("CROSS_REVIEW_V2_UNTIL_STOPPED_MAX_COST_USD", "20", "User")
+```
+
+Set the eight provider rate-card variables from current official provider pricing before running paid cross-review sessions. `server_info` reports `financial_controls.paid_calls_ready` and the exact missing variable names.
+
+For example, if official pricing says a provider model costs `15.00` USD per million input tokens and `75.00` USD per million output tokens, configure that provider with:
+
+```powershell
+[Environment]::SetEnvironmentVariable("CROSS_REVIEW_OPENAI_INPUT_USD_PER_MILLION", "15", "User")
+[Environment]::SetEnvironmentVariable("CROSS_REVIEW_OPENAI_OUTPUT_USD_PER_MILLION", "75", "User")
+```
+
+Repeat the same pattern for Anthropic, Gemini and DeepSeek using their current official prices. Restart the MCP host after changing Windows environment variables.
+
+You can also set the same variables directly in the MCP host configuration. This is useful when you want a specific host entry to carry a fixed budget policy:
+
+```toml
+[mcp_servers.cross-review-v2]
+tool_timeout_sec = 1800
+command = "C:/Users/leona/AppData/Roaming/npm/cross-review-v2.cmd"
+args = []
+env_vars = [
+  "OPENAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "GEMINI_API_KEY",
+  "DEEPSEEK_API_KEY",
+  "CROSS_REVIEW_OPENAI_INPUT_USD_PER_MILLION",
+  "CROSS_REVIEW_OPENAI_OUTPUT_USD_PER_MILLION",
+  "CROSS_REVIEW_ANTHROPIC_INPUT_USD_PER_MILLION",
+  "CROSS_REVIEW_ANTHROPIC_OUTPUT_USD_PER_MILLION",
+  "CROSS_REVIEW_GEMINI_INPUT_USD_PER_MILLION",
+  "CROSS_REVIEW_GEMINI_OUTPUT_USD_PER_MILLION",
+  "CROSS_REVIEW_DEEPSEEK_INPUT_USD_PER_MILLION",
+  "CROSS_REVIEW_DEEPSEEK_OUTPUT_USD_PER_MILLION",
+]
+env = {
+  CROSS_REVIEW_V2_MAX_SESSION_COST_USD = "20",
+  CROSS_REVIEW_V2_PREFLIGHT_MAX_ROUND_COST_USD = "20",
+  CROSS_REVIEW_V2_UNTIL_STOPPED_MAX_COST_USD = "20"
+}
+```
+
+If a run is blocked, call `server_info` and check:
+
+- `financial_controls.paid_calls_ready`: `false` means the server is intentionally refusing paid calls.
+- `financial_controls.missing_variables`: exact variable names that must be configured.
+- `financial_controls.policy`: the reason paid calls are blocked.
+
 ## Token Streaming
 
 Token streaming is enabled by default. Provider progress is written to the session event stream as `peer.token.delta` events with character counts, followed by one `peer.token.completed` event per peer call. This lets MCP hosts, dashboards and future UIs show long-running work as it happens instead of waiting for the complete provider response.
@@ -233,7 +315,7 @@ Then open `http://127.0.0.1:4588`.
 
 Use optional `review_focus` when a broad review needs a stable scope anchor, for example `services/billing`, `src/core/session-store.ts`, or `release automation`.
 
-The field is available on `session_init`, `ask_peers`, `session_start_round`, `run_until_unanimous` and `session_start_unanimous`. Session-level focus is saved as `meta.review_focus`; per-call focus overrides it for that round or unanimous run. The runtime injects the value as a bounded/redacted Markdown `Review Focus` block at the start of generation, review, revision and retry prompts. If an operator accidentally pastes a leading `/focus`, the prefix is stripped during normalization and only the plain scope text is forwarded.
+The field is available on `session_init`, `ask_peers`, `session_start_round`, `run_until_unanimous` and `session_start_unanimous`. Session-level focus is saved as `meta.review_focus`; per-call focus overrides it for that round or unanimous run. The runtime injects the value as a bounded/redacted `Review Focus` block at the start of generation, review, revision and retry prompts, wrapping the operator-provided text in escaped `<review_focus>...</review_focus>` delimiters. The tagged content is treated as scope data, not as instructions that override the cross-review protocol, response schema, safety rules, or task directives. If an operator accidentally pastes a leading `/focus`, the prefix is stripped during normalization and only the plain scope text is forwarded.
 
 The injected block also tells reviewers to label possible findings outside that focus as `OUT OF SCOPE` instead of counting them as blocking issues, unless the issue is a critical cross-cutting blocker that invalidates the result. This keeps broad reviews anchored without hiding genuinely fatal problems.
 
@@ -263,7 +345,7 @@ Secret redaction is applied when prompts, responses, evidence and JSON metadata 
 
 ## Status
 
-Current version: `v02.03.02` (npm package `2.3.2`).
+Current version: `v02.03.03` (npm package `2.3.3`).
 
 Version `v02.01.00` (npm package `2.1.0`) is the first stable release of `cross-review-v2`.
 

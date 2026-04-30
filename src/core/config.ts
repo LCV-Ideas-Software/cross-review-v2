@@ -3,9 +3,15 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { AppConfig, PeerId } from "./types.js";
 
-export const VERSION = "2.3.2";
+export const VERSION = "2.3.3";
 export const RELEASE_DATE = "2026-04-30";
 export const DEFAULT_MAX_OUTPUT_TOKENS = 20_000;
+const COST_RATE_ENV_PREFIX: Record<PeerId, string> = {
+  codex: "CROSS_REVIEW_OPENAI",
+  claude: "CROSS_REVIEW_ANTHROPIC",
+  gemini: "CROSS_REVIEW_GEMINI",
+  deepseek: "CROSS_REVIEW_DEEPSEEK",
+};
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -128,8 +134,9 @@ export function loadConfig(): AppConfig {
     },
     budget: {
       max_session_cost_usd: numberEnv("CROSS_REVIEW_V2_MAX_SESSION_COST_USD"),
+      until_stopped_max_cost_usd: numberEnv("CROSS_REVIEW_V2_UNTIL_STOPPED_MAX_COST_USD"),
       preflight_max_round_cost_usd: numberEnv("CROSS_REVIEW_V2_PREFLIGHT_MAX_ROUND_COST_USD"),
-      require_rates_for_budget: boolEnv("CROSS_REVIEW_V2_BUDGET_REQUIRE_RATES", false),
+      require_rates_for_budget: true,
     },
     prompt: {
       max_task_chars: intEnv("CROSS_REVIEW_V2_MAX_TASK_CHARS", 8_000),
@@ -170,12 +177,39 @@ export function loadConfig(): AppConfig {
       deepseek: keyForPeer("deepseek"),
     },
     cost_rates: {
-      codex: costRate("CROSS_REVIEW_OPENAI"),
-      claude: costRate("CROSS_REVIEW_ANTHROPIC"),
-      gemini: costRate("CROSS_REVIEW_GEMINI"),
-      deepseek: costRate("CROSS_REVIEW_DEEPSEEK"),
+      codex: costRate(COST_RATE_ENV_PREFIX.codex),
+      claude: costRate(COST_RATE_ENV_PREFIX.claude),
+      gemini: costRate(COST_RATE_ENV_PREFIX.gemini),
+      deepseek: costRate(COST_RATE_ENV_PREFIX.deepseek),
     },
   };
+}
+
+export function missingFinancialControlVars(
+  config: AppConfig,
+  peers: PeerId[],
+  options: { untilStopped?: boolean } = {},
+): string[] {
+  const missing = new Set<string>();
+
+  if (config.budget.max_session_cost_usd == null) {
+    missing.add("CROSS_REVIEW_V2_MAX_SESSION_COST_USD");
+  }
+  if (config.budget.preflight_max_round_cost_usd == null) {
+    missing.add("CROSS_REVIEW_V2_PREFLIGHT_MAX_ROUND_COST_USD");
+  }
+  if (options.untilStopped && config.budget.until_stopped_max_cost_usd == null) {
+    missing.add("CROSS_REVIEW_V2_UNTIL_STOPPED_MAX_COST_USD");
+  }
+
+  for (const peer of peers) {
+    if (config.cost_rates[peer]) continue;
+    const prefix = COST_RATE_ENV_PREFIX[peer];
+    missing.add(`${prefix}_INPUT_USD_PER_MILLION`);
+    missing.add(`${prefix}_OUTPUT_USD_PER_MILLION`);
+  }
+
+  return [...missing].sort();
 }
 
 function costRate(
