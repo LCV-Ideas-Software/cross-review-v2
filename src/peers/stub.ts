@@ -66,63 +66,76 @@ export class StubAdapter extends BasePeerAdapter implements PeerAdapter {
     if (prompt.includes("FORCE_NETWORK_FAIL") && !this.model.includes("fallback")) {
       throw new Error("network fetch failed");
     }
-    const text = prompt.includes("Cross Review - Format Recovery")
-      ? prompt.includes("FORCE_RECOVERY_FAIL")
-        ? "Still no machine-readable status."
-        : JSON.stringify({
-            status: "READY",
-            summary: "Stub recovered the previous unparseable response.",
-            confidence: "verified",
-            evidence_sources: [],
-            caller_requests: [],
-            follow_ups: [],
-          })
-      : prompt.includes("FORCE_BAD_FORMAT_UNRECOVERABLE")
-        ? "I am READY, but this intentionally lacks JSON. FORCE_RECOVERY_FAIL"
-        : prompt.includes("FORCE_BAD_FORMAT")
-          ? "I am READY, but this intentionally lacks the required machine-readable status object."
-          : prompt.includes("FORCE_NOT_READY") || prompt.includes("FORCE_NEEDS_EVIDENCE")
-            ? JSON.stringify({
-                status: prompt.includes("FORCE_NEEDS_EVIDENCE") ? "NEEDS_EVIDENCE" : "NOT_READY",
-                summary: "Stub detected a test marker.",
-                confidence: "verified",
-                evidence_sources: [],
-                caller_requests: ["Remove the test marker."],
-                follow_ups: [],
-              })
-            : prompt.includes("FORCE_CANCEL_SLOW")
-              ? await new Promise<string>((resolve, reject) => {
-                  const timer = setTimeout(
-                    () =>
-                      resolve(
-                        JSON.stringify({
-                          status: "READY",
-                          summary: "Stub completed after a cancellable delay.",
-                          confidence: "verified",
-                          evidence_sources: [],
-                          caller_requests: [],
-                          follow_ups: [],
-                        }),
-                      ),
-                    10_000,
-                  );
-                  context.signal?.addEventListener(
-                    "abort",
-                    () => {
-                      clearTimeout(timer);
-                      reject(new Error("AbortError: stub call cancelled"));
-                    },
-                    { once: true },
-                  );
-                })
-              : JSON.stringify({
-                  status: "READY",
-                  summary: "Stub approved the test round.",
-                  confidence: "verified",
-                  evidence_sources: [],
-                  caller_requests: [],
-                  follow_ups: [],
-                });
+    const text = prompt.includes("Cross Review - Decision Retry")
+      ? JSON.stringify({
+          status: "READY",
+          summary: "Stub completed a full decision retry after an empty response.",
+          confidence: "verified",
+          evidence_sources: [],
+          caller_requests: [],
+          follow_ups: [],
+        })
+      : prompt.includes("Cross Review - Format Recovery")
+        ? prompt.includes("FORCE_RECOVERY_FAIL")
+          ? "Still no machine-readable status."
+          : JSON.stringify({
+              status: "READY",
+              summary: "Stub recovered the previous unparseable response.",
+              confidence: "verified",
+              evidence_sources: [],
+              caller_requests: [],
+              follow_ups: [],
+            })
+        : prompt.includes("FORCE_BAD_FORMAT_UNRECOVERABLE")
+          ? "I am READY, but this intentionally lacks JSON. FORCE_RECOVERY_FAIL"
+          : prompt.includes("FORCE_EMPTY_REVIEW")
+            ? ""
+            : prompt.includes("FORCE_BAD_FORMAT")
+              ? "I am READY, but this intentionally lacks the required machine-readable status object."
+              : prompt.includes("FORCE_NOT_READY") || prompt.includes("FORCE_NEEDS_EVIDENCE")
+                ? JSON.stringify({
+                    status: prompt.includes("FORCE_NEEDS_EVIDENCE")
+                      ? "NEEDS_EVIDENCE"
+                      : "NOT_READY",
+                    summary: "Stub detected a test marker.",
+                    confidence: "verified",
+                    evidence_sources: [],
+                    caller_requests: ["Remove the test marker."],
+                    follow_ups: [],
+                  })
+                : prompt.includes("FORCE_CANCEL_SLOW")
+                  ? await new Promise<string>((resolve, reject) => {
+                      const timer = setTimeout(
+                        () =>
+                          resolve(
+                            JSON.stringify({
+                              status: "READY",
+                              summary: "Stub completed after a cancellable delay.",
+                              confidence: "verified",
+                              evidence_sources: [],
+                              caller_requests: [],
+                              follow_ups: [],
+                            }),
+                          ),
+                        10_000,
+                      );
+                      context.signal?.addEventListener(
+                        "abort",
+                        () => {
+                          clearTimeout(timer);
+                          reject(new Error("AbortError: stub call cancelled"));
+                        },
+                        { once: true },
+                      );
+                    })
+                  : JSON.stringify({
+                      status: "READY",
+                      summary: "Stub approved the test round.",
+                      confidence: "verified",
+                      evidence_sources: [],
+                      caller_requests: [],
+                      follow_ups: [],
+                    });
     return this.resultFromText({
       text,
       raw: { stub: true },

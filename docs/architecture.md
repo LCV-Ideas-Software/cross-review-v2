@@ -76,6 +76,17 @@ Provider model APIs are queried at probe/session initialization:
 
 The selected model and selection evidence are persisted in the session capability snapshot.
 
+## Provider Thinking Baseline
+
+The peer adapters use the strongest official reasoning controls available for each provider because cross-review is correctness-oriented:
+
+- OpenAI runs through the Responses API with high reasoning effort.
+- Anthropic uses adaptive thinking and omits raw thinking content from responses.
+- Gemini enables thinking configuration for Gemini 3.x and the Gemini 2.5 fallback.
+- DeepSeek enables Thinking Mode and follows the official multi-round guidance by resending the summarized session context in each stateless request.
+
+Raw chain-of-thought is not persisted. Session continuity is represented through prompts, structured peer decisions, summaries and artifacts.
+
 ## Stable Rename
 
 Stable version `2.1.0` renamed the active product to `cross-review-v2`. The earlier development

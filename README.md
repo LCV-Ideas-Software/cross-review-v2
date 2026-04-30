@@ -48,9 +48,11 @@ At startup/session initialization, the server queries provider model APIs when k
 Current documented priority defaults:
 
 - OpenAI/Codex: `gpt-5.5` with `CROSS_REVIEW_OPENAI_REASONING_EFFORT=xhigh`.
-- Anthropic/Claude: `claude-opus-4-7`.
+- Anthropic/Claude: `claude-opus-4-7` with adaptive thinking and `CROSS_REVIEW_ANTHROPIC_REASONING_EFFORT=xhigh`.
 - Google/Gemini: `gemini-3.1-pro-preview`.
 - DeepSeek: `deepseek-v4-pro`.
+
+Cross-review requires advanced thinking/reasoning-capable models. Model priority lists must not include provider models that are known to lack thinking support, low-capacity models that are unsuitable for peer review, or models marked for deprecation in official provider documentation. If no advanced priority model is available to a key, the runtime keeps the documented advanced fallback so the problem is visible instead of silently downgrading.
 
 Explicit env var overrides always win:
 
@@ -58,8 +60,10 @@ Explicit env var overrides always win:
 [Environment]::SetEnvironmentVariable("CROSS_REVIEW_OPENAI_MODEL", "gpt-5.5", "User")
 [Environment]::SetEnvironmentVariable("CROSS_REVIEW_OPENAI_REASONING_EFFORT", "xhigh", "User")
 [Environment]::SetEnvironmentVariable("CROSS_REVIEW_ANTHROPIC_MODEL", "claude-opus-4-7", "User")
+[Environment]::SetEnvironmentVariable("CROSS_REVIEW_ANTHROPIC_REASONING_EFFORT", "xhigh", "User")
 [Environment]::SetEnvironmentVariable("CROSS_REVIEW_GEMINI_MODEL", "gemini-3.1-pro-preview", "User")
 [Environment]::SetEnvironmentVariable("CROSS_REVIEW_DEEPSEEK_MODEL", "deepseek-v4-pro", "User")
+[Environment]::SetEnvironmentVariable("CROSS_REVIEW_DEEPSEEK_REASONING_EFFORT", "max", "User")
 ```
 
 Optional fallback model lists are comma-separated:
@@ -69,6 +73,31 @@ Optional fallback model lists are comma-separated:
 ```
 
 Each probe records the selected model, candidates returned by the API, source URL, confidence and selection reason.
+
+## Output Token Budget
+
+`CROSS_REVIEW_V2_MAX_OUTPUT_TOKENS` controls the maximum output budget sent to all peer providers. The same value is applied to OpenAI, Anthropic, Gemini and DeepSeek for review calls and generation calls.
+
+Default: `20000`.
+
+Set it in the MCP host configuration when you want the limit to travel with that MCP server entry:
+
+```toml
+[mcp_servers.cross-review-v2]
+tool_timeout_sec = 1800
+command = "C:/Users/leona/AppData/Roaming/npm/cross-review-v2.cmd"
+args = []
+env_vars = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "DEEPSEEK_API_KEY"]
+env = { CROSS_REVIEW_V2_MAX_OUTPUT_TOKENS = "20000" }
+```
+
+You can also set it as a Windows environment variable:
+
+```powershell
+[Environment]::SetEnvironmentVariable("CROSS_REVIEW_V2_MAX_OUTPUT_TOKENS", "20000", "User")
+```
+
+Invalid, zero or negative values are ignored and the runtime falls back to `20000`.
 
 ## Install
 
@@ -92,6 +121,7 @@ tool_timeout_sec = 300
 command = "node"
 args = ["C:/Users/leona/lcv-workspace/cross-review-mcp-v2/dist/src/mcp/server.js"]
 env_vars = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "DEEPSEEK_API_KEY"]
+env = { CROSS_REVIEW_V2_MAX_OUTPUT_TOKENS = "20000" }
 ```
 
 Provider HTTP calls use `CROSS_REVIEW_V2_TIMEOUT_MS`, which defaults to 30 minutes. The 300s setting above is for the MCP client-to-server request.
@@ -158,5 +188,7 @@ Secret redaction is applied when prompts, responses, evidence and JSON metadata 
 - CodeQL must be enabled through GitHub Default Setup after repository creation. Advanced Setup requires prior authorization.
 
 ## Status
+
+Current version: `v02.01.01` (npm package `2.1.1`).
 
 Version `v02.01.00` (npm package `2.1.0`) is the first stable release of `cross-review-v2`.

@@ -127,7 +127,8 @@ export class OpenAIAdapter extends BasePeerAdapter implements PeerAdapter {
             },
             reasoning: { effort: openAIEffort(this.config.reasoning_effort.codex) },
             store: false,
-            max_output_tokens: 4096,
+            // OpenAI Responses API uses max_output_tokens, not Chat Completions max_tokens.
+            max_output_tokens: this.config.max_output_tokens,
           },
           { signal: context.signal, timeout: this.config.retry.timeout_ms },
         );
@@ -166,7 +167,7 @@ export class OpenAIAdapter extends BasePeerAdapter implements PeerAdapter {
             ],
             reasoning: { effort: openAIEffort(this.config.reasoning_effort.codex) },
             store: false,
-            max_output_tokens: 20000,
+            max_output_tokens: this.config.max_output_tokens,
           },
           { signal: context.signal, timeout: this.config.retry.timeout_ms },
         );

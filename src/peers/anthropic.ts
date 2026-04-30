@@ -38,6 +38,10 @@ function anthropicEffort(value: AppConfig["reasoning_effort"][PeerId]): Anthropi
   return value ?? "max";
 }
 
+function anthropicThinking(): { type: "adaptive"; display: "omitted" } {
+  return { type: "adaptive", display: "omitted" };
+}
+
 export class AnthropicAdapter extends BasePeerAdapter implements PeerAdapter {
   id: PeerId = "claude";
   provider = "anthropic";
@@ -113,11 +117,12 @@ export class AnthropicAdapter extends BasePeerAdapter implements PeerAdapter {
         const message = await this.client().messages.create(
           {
             model: this.model,
-            max_tokens: 4096,
+            max_tokens: this.config.max_output_tokens,
             system: this.systemPrompt(context),
             messages: [
               { role: "user", content: `${userPrompt(prompt)}\n\n${statusInstruction()}` },
             ],
+            thinking: anthropicThinking(),
             output_config: {
               effort: anthropicEffort(this.config.reasoning_effort.claude),
               format: {
@@ -157,9 +162,10 @@ export class AnthropicAdapter extends BasePeerAdapter implements PeerAdapter {
         const message = await this.client().messages.create(
           {
             model: this.model,
-            max_tokens: 20000,
+            max_tokens: this.config.max_output_tokens,
             system: this.systemPrompt(context),
             messages: [{ role: "user", content: userPrompt(prompt) }],
+            thinking: anthropicThinking(),
             output_config: {
               effort: anthropicEffort(this.config.reasoning_effort.claude),
             },

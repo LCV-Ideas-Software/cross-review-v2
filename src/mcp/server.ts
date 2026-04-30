@@ -205,6 +205,7 @@ export async function main(): Promise<void> {
           retry_timeout_ms: runtime.config.retry.timeout_ms,
           budget: runtime.config.budget,
           prompt: runtime.config.prompt,
+          max_output_tokens: runtime.config.max_output_tokens,
           streaming: runtime.config.streaming,
           codeql_policy: "Default Setup on GitHub; no advanced workflow committed.",
           secrets_policy: "API keys are read from Windows environment variables only.",

@@ -8,6 +8,8 @@ import { CrossReviewOrchestrator } from "../src/core/orchestrator.js";
 import { parsePeerStatus } from "../src/core/status.js";
 import { PEERS } from "../src/core/types.js";
 import type { PeerResult } from "../src/core/types.js";
+import { selectFromCandidates } from "../src/peers/model-selection.js";
+import { redact } from "../src/security/redact.js";
 
 process.env.CROSS_REVIEW_V2_STUB = "1";
 process.env.CROSS_REVIEW_V2_DATA_DIR =
@@ -19,7 +21,24 @@ for (const provider of ["OPENAI", "ANTHROPIC", "GEMINI", "DEEPSEEK"]) {
   process.env[`CROSS_REVIEW_${provider}_OUTPUT_USD_PER_MILLION`] ??= "1000";
 }
 
+const previousMaxOutputTokens = process.env.CROSS_REVIEW_V2_MAX_OUTPUT_TOKENS;
+process.env.CROSS_REVIEW_V2_MAX_OUTPUT_TOKENS = "32000";
+assert.equal(loadConfig().max_output_tokens, 32_000);
+process.env.CROSS_REVIEW_V2_MAX_OUTPUT_TOKENS = "not-a-number";
+assert.equal(loadConfig().max_output_tokens, 20_000);
+if (previousMaxOutputTokens == null) {
+  delete process.env.CROSS_REVIEW_V2_MAX_OUTPUT_TOKENS;
+} else {
+  process.env.CROSS_REVIEW_V2_MAX_OUTPUT_TOKENS = previousMaxOutputTokens;
+}
+
 const config = loadConfig();
+assert.equal(
+  config.max_output_tokens,
+  previousMaxOutputTokens && Number.parseInt(previousMaxOutputTokens, 10) > 0
+    ? Number.parseInt(previousMaxOutputTokens, 10)
+    : 20_000,
+);
 const events: string[] = [];
 const holder: { orchestrator?: CrossReviewOrchestrator } = {};
 const orchestrator = new CrossReviewOrchestrator(config, (event) => {
@@ -27,6 +46,134 @@ const orchestrator = new CrossReviewOrchestrator(config, (event) => {
   holder.orchestrator?.store.appendEvent(event);
 });
 holder.orchestrator = orchestrator;
+
+const adapterExpectations: Array<{ file: string; field: string }> = [
+  { file: "src/peers/openai.ts", field: "max_output_tokens: this.config.max_output_tokens" },
+  { file: "src/peers/anthropic.ts", field: "max_tokens: this.config.max_output_tokens" },
+  { file: "src/peers/anthropic.ts", field: "thinking: anthropicThinking()" },
+  { file: "src/peers/anthropic.ts", field: 'type: "adaptive"' },
+  { file: "src/peers/gemini.ts", field: "maxOutputTokens: this.config.max_output_tokens" },
+  { file: "src/peers/gemini.ts", field: "thinkingConfig: geminiThinkingConfig(this.model)" },
+  { file: "src/peers/gemini.ts", field: "ThinkingLevel.HIGH" },
+  { file: "src/peers/deepseek.ts", field: "max_tokens: this.config.max_output_tokens" },
+  { file: "src/peers/deepseek.ts", field: 'type: "enabled"' },
+  { file: "src/peers/deepseek.ts", field: "reasoning_effort:" },
+  { file: "src/peers/deepseek.ts", field: "...deepSeekThinking(this.config)" },
+];
+
+for (const { file, field } of adapterExpectations) {
+  const source = fs.readFileSync(file, "utf8");
+  assert.ok(source.includes(field), `${file} must use configurable ${field}`);
+  assert.ok(!source.includes("4096"), `${file} must not keep the old 4096 output limit`);
+  assert.ok(!source.includes("12000"), `${file} must not keep the temporary OpenAI limit`);
+}
+
+const modelSelectionSource = fs.readFileSync("src/peers/model-selection.ts", "utf8");
+for (const deprecatedOrWeakModel of [
+  "claude-haiku-4-5",
+  "gemini-3-pro-preview",
+  "deepseek-reasoner",
+  "deepseek-chat",
+]) {
+  assert.ok(
+    !modelSelectionSource.includes(`"${deprecatedOrWeakModel}"`),
+    `${deprecatedOrWeakModel} must not be in active priority lists`,
+  );
+}
+
+const noWeakDowngrade = selectFromCandidates(
+  "claude",
+  [{ id: "claude-haiku-4-5-20251001", source: "api" }],
+  "claude-opus-4-7",
+);
+assert.equal(noWeakDowngrade.selected, "claude-opus-4-7");
+assert.equal(noWeakDowngrade.confidence, "unknown");
+assert.match(noWeakDowngrade.reason, /silently downgrading/);
+
+const pemMarker = (side: "BEGIN" | "END", label: string): string =>
+  ["-----", side, " ", label, "-----"].join("");
+const pemBlock = (label: string, body = "not-a-real-key-material"): string =>
+  [pemMarker("BEGIN", label), body, pemMarker("END", label)].join("\n");
+
+for (const label of [
+  "PRIVATE KEY",
+  "OPENSSH PRIVATE KEY",
+  "EC PRIVATE KEY",
+  "RSA PRIVATE KEY",
+  "DSA PRIVATE KEY",
+]) {
+  assert.equal(redact(`prefix ${pemBlock(label)} suffix`), "prefix [REDACTED] suffix");
+}
+
+assert.equal(
+  redact(
+    [pemBlock("RSA PRIVATE KEY", "first"), "middle", pemBlock("EC PRIVATE KEY", "second")].join(
+      "\r\n",
+    ),
+  ),
+  "[REDACTED]\r\nmiddle\r\n[REDACTED]",
+);
+
+const mismatchedPem = [
+  pemMarker("BEGIN", "OPENSSH PRIVATE KEY"),
+  "legacy-compatible-redaction",
+  pemMarker("END", "RSA PRIVATE KEY"),
+].join("\n");
+assert.equal(redact(`before ${mismatchedPem} after`), "before [REDACTED] after");
+
+const overlappingPem = [
+  pemMarker("BEGIN", "RSA PRIVATE KEY"),
+  "outer-before",
+  pemMarker("BEGIN", "EC PRIVATE KEY"),
+  "inner",
+  pemMarker("END", "EC PRIVATE KEY"),
+  "outer-after",
+  pemMarker("END", "RSA PRIVATE KEY"),
+].join("\n");
+assert.equal(redact(`before ${overlappingPem} after`), "before [REDACTED] after");
+
+const unterminatedPem = `${pemMarker("BEGIN", "EC PRIVATE KEY")}\nmissing end`;
+assert.equal(redact(unterminatedPem), unterminatedPem);
+
+const completeThenUnterminated = [
+  pemBlock("RSA PRIVATE KEY", "first"),
+  "preserve this middle text",
+  pemMarker("BEGIN", "RSA PRIVATE KEY"),
+  "missing end",
+].join("\n");
+assert.equal(
+  redact(completeThenUnterminated),
+  [
+    "[REDACTED]",
+    "preserve this middle text",
+    pemMarker("BEGIN", "RSA PRIVATE KEY"),
+    "missing end",
+  ].join("\n"),
+);
+
+const adversarialPem = `${pemMarker("BEGIN", "EC PRIVATE KEY")}\n${pemMarker(
+  "BEGIN",
+  "DSA PRIVATE KEY",
+).repeat(2_000)}`;
+const adversarialStarted = Date.now();
+assert.equal(redact(adversarialPem), adversarialPem);
+assert.equal(Date.now() - adversarialStarted < 1_000, true);
+
+const repeatedSameLabelStarted = Date.now();
+const repeatedSameLabel = pemMarker("BEGIN", "RSA PRIVATE KEY").repeat(2_000);
+assert.equal(redact(repeatedSameLabel), repeatedSameLabel);
+assert.equal(Date.now() - repeatedSameLabelStarted < 1_000, true);
+
+const constructedToken = ["sk", "test", "A".repeat(24)].join("-");
+assert.equal(redact(`token ${constructedToken}`), "token [REDACTED]");
+
+const dashboardSource = fs.readFileSync(
+  path.join(process.cwd(), "src", "dashboard", "server.ts"),
+  "utf8",
+);
+assert.match(dashboardSource, /console\.error\("dashboard_request_failed"\)/);
+assert.doesNotMatch(dashboardSource, /console\.error\(`dashboard_request_failed/);
+assert.doesNotMatch(dashboardSource, /safeErrorMessage\(error\)/);
 
 const overlongReady = parsePeerStatus(
   JSON.stringify({
@@ -168,6 +315,20 @@ assert.equal(
   true,
 );
 assert.equal(formatRecovered.round.peers[0]?.decision_quality, "recovered");
+
+const emptyDecisionRecovered = await orchestrator.askPeers({
+  task: "Verify automatic full decision retry after empty peer output.",
+  draft: "FORCE_EMPTY_REVIEW",
+  caller: "operator",
+  peers: ["codex"],
+});
+assert.equal(emptyDecisionRecovered.converged, true);
+assert.equal(emptyDecisionRecovered.round.peers[0]?.status, "READY");
+assert.equal(
+  emptyDecisionRecovered.round.peers[0]?.parser_warnings.includes("decision_retry_succeeded"),
+  true,
+);
+assert.equal(emptyDecisionRecovered.round.peers[0]?.decision_quality, "recovered");
 
 const formatRecoveryFailed = await orchestrator.askPeers({
   task: "Verify automatic parser format recovery failure handling.",

@@ -7,6 +7,20 @@ standard `v00.00.00`; npm package versions remain SemVer.
 
 ## [Unreleased]
 
+## [v02.01.01] - 2026-04-30
+
+### Fixed
+
+- Removed the CodeQL `js/polynomial-redos` alert from secret redaction by replacing the private-key block regular expression with bounded delimiter scanning.
+- Removed the CodeQL `js/log-injection` alert from the dashboard error path by avoiding user-controlled error text in the console log line.
+- Added regression coverage for mismatched, unterminated, repeated and overlapping private-key markers so malformed PEM-like payloads remain safely redacted without reintroducing ReDoS risk.
+- Added a full decision retry when a peer returns no usable review decision, preventing empty provider output from becoming a false `NEEDS_EVIDENCE` recovery.
+- Added configurable `CROSS_REVIEW_V2_MAX_OUTPUT_TOKENS` support and standardized the high output-token budget across OpenAI, Anthropic, Gemini and DeepSeek review/generation calls.
+- Tightened model selection to advanced thinking-capable models only, removed weak/deprecated fallbacks, and enabled provider-specific thinking controls for Anthropic, Gemini and DeepSeek.
+- Added smoke coverage proving weak/deprecated returned candidates do not trigger silent model downgrades, plus a redacted real-API capability report for the four provider keys.
+- Raised the default Anthropic effort to `xhigh` for Claude Opus 4.7 adaptive-thinking review work.
+- Removed residual public references to the temporary development package name after the stable `cross-review-v2` rename.
+
 ## [v02.01.00] - 2026-04-29
 
 ### Added

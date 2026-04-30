@@ -321,6 +321,7 @@ export interface AppConfig {
     max_prior_rounds: number;
     max_peer_requests: number;
   };
+  max_output_tokens: number;
   streaming: {
     events: boolean;
     tokens: false;

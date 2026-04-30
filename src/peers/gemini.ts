@@ -1,4 +1,4 @@
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import type {
   AppConfig,
   GenerationResult,
@@ -36,6 +36,17 @@ function usageFromGemini(usage: GeminiUsage | undefined): TokenUsage | undefined
     total_tokens: usage.totalTokenCount,
     reasoning_tokens: usage.thoughtsTokenCount,
   };
+}
+
+function geminiThinkingConfig(model: string): {
+  includeThoughts: false;
+  thinkingBudget?: number;
+  thinkingLevel?: ThinkingLevel;
+} {
+  if (/gemini-3/i.test(model)) {
+    return { includeThoughts: false, thinkingLevel: ThinkingLevel.HIGH };
+  }
+  return { includeThoughts: false, thinkingBudget: -1 };
 }
 
 export class GeminiAdapter extends BasePeerAdapter implements PeerAdapter {
@@ -117,7 +128,8 @@ export class GeminiAdapter extends BasePeerAdapter implements PeerAdapter {
           config: {
             responseMimeType: "application/json",
             responseJsonSchema: statusJsonSchema,
-            maxOutputTokens: 4096,
+            maxOutputTokens: this.config.max_output_tokens,
+            thinkingConfig: geminiThinkingConfig(this.model),
           },
         })) as GeminiResponse;
         return this.resultFromText({
@@ -149,7 +161,10 @@ export class GeminiAdapter extends BasePeerAdapter implements PeerAdapter {
         const response = (await this.client().models.generateContent({
           model: this.model,
           contents: `${this.systemPrompt(context)}\n\n${userPrompt(prompt)}`,
-          config: { maxOutputTokens: 20000 },
+          config: {
+            maxOutputTokens: this.config.max_output_tokens,
+            thinkingConfig: geminiThinkingConfig(this.model),
+          },
         })) as GeminiResponse;
         return this.generationFromText({
           text: response.text ?? JSON.stringify(response),

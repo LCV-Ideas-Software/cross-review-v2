@@ -221,6 +221,37 @@ function buildFormatRecoveryPrompt(
   ].join("\n");
 }
 
+function buildDecisionRetryPrompt(
+  meta: SessionMeta,
+  draft: string,
+  priorResponse: string,
+  config: AppConfig,
+): string {
+  return [
+    "# Cross Review - Decision Retry",
+    "",
+    "Your previous provider response contained no usable peer-review decision.",
+    "Re-review the artifact now instead of trying to recover the empty response.",
+    "Return exactly one compact JSON decision using the required response schema.",
+    "",
+    "## Original Task",
+    safePromptText(meta.task, Math.min(config.prompt.max_task_chars, 4_000)),
+    "",
+    "## Recent History",
+    summarizePriorRounds(meta, config),
+    "",
+    "## Draft Or Solution Under Review",
+    safePromptText(draft, Math.min(config.prompt.max_draft_chars, 20_000)),
+    "",
+    "## Previous Non-Decision Response",
+    safePromptText(priorResponse || "[empty response]", 1_200),
+  ].join("\n");
+}
+
+function containsReviewDecisionLexeme(text: string): boolean {
+  return /\b(?:READY|NOT_READY|NEEDS_EVIDENCE)\b/.test(text);
+}
+
 function uniquePeers(peers: PeerId[]): PeerId[] {
   return [...new Set(peers)];
 }
@@ -303,7 +334,7 @@ function estimatedPeerRoundCost(
     const rate = config.cost_rates[peer];
     if (!rate) return undefined;
     const inputTokens = Math.ceil(prompt.length / 4);
-    const outputTokens = 4096;
+    const outputTokens = config.max_output_tokens;
     total += (inputTokens / 1_000_000) * rate.input_per_million;
     total += (outputTokens / 1_000_000) * rate.output_per_million;
   }
@@ -714,6 +745,7 @@ export class CrossReviewOrchestrator {
       if (item.result) {
         let peerResult = item.result;
         if (peerResult.status == null && peerResult.model_match !== false) {
+          const decisionRetry = !containsReviewDecisionLexeme(peerResult.text);
           this.store.savePeerResult(
             session.session_id,
             roundNumber,
@@ -725,12 +757,15 @@ export class CrossReviewOrchestrator {
             session_id: session.session_id,
             round: roundNumber,
             peer: peerResult.peer,
-            message:
-              "Peer response did not include a parseable status; requesting format recovery.",
+            message: decisionRetry
+              ? "Peer response did not include a usable decision; requesting a full decision retry."
+              : "Peer response did not include a parseable status; requesting format recovery.",
           });
           try {
             const recovered = await adapter.call(
-              buildFormatRecoveryPrompt(session, peerResult.text, this.config),
+              decisionRetry
+                ? buildDecisionRetryPrompt(session, input.draft, peerResult.text, this.config)
+                : buildFormatRecoveryPrompt(session, peerResult.text, this.config),
               {
                 session_id: session.session_id,
                 round: roundNumber,
@@ -743,8 +778,12 @@ export class CrossReviewOrchestrator {
               ...peerResult.parser_warnings.map((warning) => `original:${warning}`),
               ...recovered.parser_warnings,
               recovered.status
-                ? "format_recovery_retry_succeeded"
-                : "format_recovery_retry_returned_no_status",
+                ? decisionRetry
+                  ? "decision_retry_succeeded"
+                  : "format_recovery_retry_succeeded"
+                : decisionRetry
+                  ? "decision_retry_returned_no_status"
+                  : "format_recovery_retry_returned_no_status",
             ];
             peerResult = {
               ...recovered,

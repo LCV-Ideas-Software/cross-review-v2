@@ -24,6 +24,16 @@ type ChatUsage = {
   };
 };
 
+type DeepSeekReasoningEffort = "high" | "max";
+type DeepSeekThinkingExtension = {
+  thinking: {
+    type: "enabled";
+    reasoning_effort: DeepSeekReasoningEffort;
+  };
+};
+type DeepSeekChatPayload = OpenAI.ChatCompletionCreateParamsNonStreaming &
+  DeepSeekThinkingExtension;
+
 function usageFromChat(usage: ChatUsage | null | undefined): TokenUsage | undefined {
   if (!usage) return undefined;
   return {
@@ -38,6 +48,21 @@ function chatText(response: {
   choices?: Array<{ message?: { content?: string | null } }>;
 }): string {
   return response.choices?.[0]?.message?.content?.trim() || JSON.stringify(response);
+}
+
+function deepSeekReasoningEffort(
+  value: AppConfig["reasoning_effort"][PeerId],
+): DeepSeekReasoningEffort {
+  return value === "max" || value === "xhigh" ? "max" : "high";
+}
+
+function deepSeekThinking(config: AppConfig): DeepSeekThinkingExtension {
+  return {
+    thinking: {
+      type: "enabled",
+      reasoning_effort: deepSeekReasoningEffort(config.reasoning_effort.deepseek),
+    },
+  };
 }
 
 export class DeepSeekAdapter extends BasePeerAdapter implements PeerAdapter {
@@ -109,18 +134,22 @@ export class DeepSeekAdapter extends BasePeerAdapter implements PeerAdapter {
           peer: this.id,
           message: `DeepSeek review attempt ${attempt}`,
         });
-        const response = await this.client().chat.completions.create(
-          {
-            model: this.model,
-            messages: [
-              { role: "system", content: this.systemPrompt(context) },
-              { role: "user", content: `${userPrompt(prompt)}\n\n${statusInstruction()}` },
-            ],
-            response_format: { type: "json_object" },
-            max_tokens: 4096,
-          },
-          { signal: context.signal, timeout: this.config.retry.timeout_ms },
-        );
+        const payload: DeepSeekChatPayload = {
+          ...deepSeekThinking(this.config),
+          model: this.model,
+          messages: [
+            { role: "system", content: this.systemPrompt(context) },
+            { role: "user", content: `${userPrompt(prompt)}\n\n${statusInstruction()}` },
+          ],
+          response_format: { type: "json_object" },
+          max_tokens: this.config.max_output_tokens,
+        };
+        // DeepSeek's OpenAI-compatible API accepts the non-OpenAI `thinking` body field;
+        // the OpenAI JS client forwards unknown body keys, and the real API smoke verifies it.
+        const response = await this.client().chat.completions.create(payload, {
+          signal: context.signal,
+          timeout: this.config.retry.timeout_ms,
+        });
         return this.resultFromText({
           text: chatText(response),
           raw: response,
@@ -147,17 +176,21 @@ export class DeepSeekAdapter extends BasePeerAdapter implements PeerAdapter {
           peer: this.id,
           message: `DeepSeek generation attempt ${attempt}`,
         });
-        const response = await this.client().chat.completions.create(
-          {
-            model: this.model,
-            messages: [
-              { role: "system", content: this.systemPrompt(context) },
-              { role: "user", content: userPrompt(prompt) },
-            ],
-            max_tokens: 20000,
-          },
-          { signal: context.signal, timeout: this.config.retry.timeout_ms },
-        );
+        const payload: DeepSeekChatPayload = {
+          ...deepSeekThinking(this.config),
+          model: this.model,
+          messages: [
+            { role: "system", content: this.systemPrompt(context) },
+            { role: "user", content: userPrompt(prompt) },
+          ],
+          max_tokens: this.config.max_output_tokens,
+        };
+        // DeepSeek's OpenAI-compatible API accepts the non-OpenAI `thinking` body field;
+        // the OpenAI JS client forwards unknown body keys, and the real API smoke verifies it.
+        const response = await this.client().chat.completions.create(payload, {
+          signal: context.signal,
+          timeout: this.config.retry.timeout_ms,
+        });
         return this.generationFromText({
           text: chatText(response),
           raw: response,

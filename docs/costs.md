@@ -12,6 +12,8 @@ Runtime calls are real provider API calls by default.
 
 The server records token usage returned by providers. Cost estimates are marked `unknown-rate` unless rates are configured in code or future runtime configuration. This avoids stale hard-coded prices because provider pricing changes frequently.
 
+`CROSS_REVIEW_V2_MAX_OUTPUT_TOKENS` controls the maximum output budget requested from all providers. The default is `20000`; raise or lower it in the MCP host configuration according to the desired quality/cost tradeoff. Invalid, zero or negative values fall back to the default.
+
 ## Optional Rate Configuration
 
 Set rates through Windows environment variables when you want session reports to

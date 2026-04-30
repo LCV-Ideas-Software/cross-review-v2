@@ -3,8 +3,9 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { AppConfig, PeerId } from "./types.js";
 
-export const VERSION = "2.1.0";
-export const RELEASE_DATE = "2026-04-29";
+export const VERSION = "2.1.1";
+export const RELEASE_DATE = "2026-04-30";
+export const DEFAULT_MAX_OUTPUT_TOKENS = 20_000;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -137,6 +138,7 @@ export function loadConfig(): AppConfig {
       max_prior_rounds: intEnv("CROSS_REVIEW_V2_MAX_PRIOR_ROUNDS", 5),
       max_peer_requests: intEnv("CROSS_REVIEW_V2_MAX_PEER_REQUESTS", 8),
     },
+    max_output_tokens: intEnv("CROSS_REVIEW_V2_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS),
     streaming: {
       events: boolEnv("CROSS_REVIEW_V2_STREAM_EVENTS", true),
       tokens: false,
@@ -155,7 +157,8 @@ export function loadConfig(): AppConfig {
     },
     reasoning_effort: {
       codex: reasoningEffort("CROSS_REVIEW_OPENAI_REASONING_EFFORT", "xhigh"),
-      claude: reasoningEffort("CROSS_REVIEW_ANTHROPIC_REASONING_EFFORT", "max"),
+      claude: reasoningEffort("CROSS_REVIEW_ANTHROPIC_REASONING_EFFORT", "xhigh"),
+      deepseek: reasoningEffort("CROSS_REVIEW_DEEPSEEK_REASONING_EFFORT", "max"),
     },
     model_selection: {},
     api_keys: {

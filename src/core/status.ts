@@ -241,6 +241,7 @@ export function decisionQualityFromStatus(
       (warning) =>
         warning.includes("recovered") ||
         warning.includes("format_recovery_retry_succeeded") ||
+        warning.includes("decision_retry_succeeded") ||
         warning.includes("moderation_safe_retry_succeeded") ||
         warning.includes("truncated") ||
         warning.includes("dropped"),

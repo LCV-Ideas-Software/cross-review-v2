@@ -21,9 +21,9 @@ const PRIORITY: Record<PeerId, string[]> = {
     "gpt-5-pro",
     "gpt-5",
   ],
-  claude: ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
-  gemini: ["gemini-3.1-pro-preview", "gemini-3-pro-preview", "gemini-2.5-pro"],
-  deepseek: ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-reasoner", "deepseek-chat"],
+  claude: ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"],
+  gemini: ["gemini-3.1-pro-preview", "gemini-2.5-pro"],
+  deepseek: ["deepseek-v4-pro", "deepseek-v4-flash"],
 };
 
 function envOverrideName(peer: PeerId): string {
@@ -47,23 +47,24 @@ function modelId(value: string): string {
   return value.replace(/^models\//, "");
 }
 
-function selectFromCandidates(
+export function selectFromCandidates(
   peer: PeerId,
   candidates: ModelCandidate[],
   fallback: string,
 ): ModelSelection {
   const available = new Set(candidates.map((candidate) => modelId(candidate.id)));
   const priority = PRIORITY[peer];
-  const selected = priority.find((id) => available.has(id)) ?? candidates[0]?.id ?? fallback;
+  const selected = priority.find((id) => available.has(id));
   return {
     peer,
-    selected: modelId(selected),
+    selected: modelId(selected ?? fallback),
     candidates,
     source_url: DOCS[peer],
-    confidence: candidates.length > 0 ? "verified" : "inferred",
-    reason:
-      candidates.length > 0
-        ? `Selected the first available model from the documented priority list: ${priority.join(" > ")}.`
+    confidence: selected ? "verified" : candidates.length > 0 ? "unknown" : "inferred",
+    reason: selected
+      ? `Selected the first available advanced thinking model from the documented priority list: ${priority.join(" > ")}.`
+      : candidates.length > 0
+        ? `Model API returned candidates, but none matched the advanced thinking priority list (${priority.join(" > ")}); using documented fallback ${fallback} so the run fails visibly if unavailable instead of silently downgrading.`
         : `Model API unavailable; using documented fallback ${fallback}.`,
   };
 }

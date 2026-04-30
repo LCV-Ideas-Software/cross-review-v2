@@ -4,7 +4,6 @@ import { loadConfig, VERSION } from "../core/config.js";
 import { CrossReviewOrchestrator } from "../core/orchestrator.js";
 import { sessionReportMarkdown } from "../core/reports.js";
 import { EventLog } from "../observability/logger.js";
-import { safeErrorMessage } from "../security/redact.js";
 
 const config = loadConfig();
 const eventLog = new EventLog(config);
@@ -254,8 +253,8 @@ const server = http.createServer(async (request, response) => {
       return;
     }
     notFound(response);
-  } catch (error) {
-    console.error(`dashboard_request_failed: ${safeErrorMessage(error)}`);
+  } catch {
+    console.error("dashboard_request_failed");
     response.writeHead(500, { "content-type": "application/json; charset=utf-8" });
     response.end(JSON.stringify({ ok: false, error: "internal_server_error" }));
   }
