@@ -23,9 +23,23 @@ function sendJson(response: http.ServerResponse, value: unknown): void {
 }
 
 function sendHtml(response: http.ServerResponse, html: string): void {
+  // v2.4.0 / audit closure: Content-Security-Policy + X-Frame-Options.
+  // The dashboard binds only to 127.0.0.1 (defense via network), but
+  // local processes can still load it. The CSP confines the page to
+  // its own origin (no third-party scripts/styles, no remote fetch),
+  // which blocks click-bait DOM injection if a future change accepts
+  // unsanitized input. `unsafe-inline` is required because the page
+  // ships an inline <style> + <script> by design; the style-src/script-src
+  // directives still block REMOTE inline injection. Anti-clickjacking
+  // headers complement the CSP for in-frame embedding attempts.
   response.writeHead(200, {
     "content-type": "text/html; charset=utf-8",
     "cache-control": "no-store",
+    "content-security-policy":
+      "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+    "x-frame-options": "DENY",
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
   });
   response.end(html);
 }

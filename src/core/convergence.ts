@@ -8,8 +8,14 @@ export function checkConvergence(
 ): ConvergenceResult {
   const ready = peers.filter((p) => p.status === "READY").map((p) => p.peer);
   const notReady = peers.filter((p) => p.status === "NOT_READY").map((p) => p.peer);
+  // v2.4.0 / audit closure (P3.15): strict equality. Pre-v2.4.0 used
+  // `p.status == null` (loose), which would also accept the empty string
+  // and the literal `0` if a future code path produced them. ReviewStatus
+  // only accepts the three sentinel strings or undefined/null in practice,
+  // so anchoring to those values eliminates a class of edge-case false
+  // positives.
   const needsEvidence = peers
-    .filter((p) => p.status === "NEEDS_EVIDENCE" || p.status == null)
+    .filter((p) => p.status === "NEEDS_EVIDENCE" || p.status === null || p.status === undefined)
     .map((p) => p.peer);
   const rejectedPeers = rejected.map((f) => f.peer);
   const responded = new Set(peers.map((p) => p.peer));

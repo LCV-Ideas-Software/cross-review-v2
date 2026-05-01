@@ -10,7 +10,7 @@ import type {
   TokenUsage,
 } from "../core/types.js";
 import { statusInstruction, statusJsonSchema } from "../core/status.js";
-import { BasePeerAdapter } from "./base.js";
+import { BasePeerAdapter, StreamBuffer } from "./base.js";
 import { classifyProviderError } from "./errors.js";
 import { withRetry } from "./retry.js";
 import { userPrompt } from "./text.js";
@@ -122,6 +122,11 @@ export class GeminiAdapter extends BasePeerAdapter implements PeerAdapter {
           peer: this.id,
           message: `Gemini review attempt ${attempt}`,
         });
+        // v2.4.0 / audit closure (P2.8): pass AbortSignal to GoogleGenAI.
+        // The SDK accepts `requestOptions.signal`; without it,
+        // session_cancel_job cannot interrupt an in-flight Gemini call
+        // and continues burning tokens until the response naturally
+        // arrives.
         const params = {
           model: this.model,
           contents: `${this.systemPrompt(context)}\n\n${userPrompt(prompt)}\n\n${statusInstruction()}`,
@@ -130,22 +135,24 @@ export class GeminiAdapter extends BasePeerAdapter implements PeerAdapter {
             responseJsonSchema: statusJsonSchema,
             maxOutputTokens: this.config.max_output_tokens,
             thinkingConfig: geminiThinkingConfig(this.model),
+            abortSignal: context.signal,
           },
         };
         if (this.shouldStreamTokens(context)) {
           const stream = await this.client().models.generateContentStream(params);
-          let text = "";
+          const stream_buffer = new StreamBuffer(this.id);
           let last: GeminiResponse | undefined;
           for await (const chunk of stream as AsyncGenerator<GeminiResponse>) {
             last = chunk;
             const delta = chunk.text ?? "";
-            text += delta;
+            stream_buffer.append(delta);
             this.emitTokenDelta(context, {
               phase: "review",
               delta,
               source: "generateContentStream.text",
             });
           }
+          const text = stream_buffer.text();
           this.emitTokenCompleted(context, { phase: "review", chars: text.length });
           return this.resultFromText({
             text: text || (last?.text ?? JSON.stringify(last ?? {})),
@@ -189,22 +196,24 @@ export class GeminiAdapter extends BasePeerAdapter implements PeerAdapter {
           config: {
             maxOutputTokens: this.config.max_output_tokens,
             thinkingConfig: geminiThinkingConfig(this.model),
+            abortSignal: context.signal,
           },
         };
         if (this.shouldStreamTokens(context)) {
           const stream = await this.client().models.generateContentStream(params);
-          let text = "";
+          const stream_buffer = new StreamBuffer(this.id);
           let last: GeminiResponse | undefined;
           for await (const chunk of stream as AsyncGenerator<GeminiResponse>) {
             last = chunk;
             const delta = chunk.text ?? "";
-            text += delta;
+            stream_buffer.append(delta);
             this.emitTokenDelta(context, {
               phase: "generation",
               delta,
               source: "generateContentStream.text",
             });
           }
+          const text = stream_buffer.text();
           this.emitTokenCompleted(context, { phase: "generation", chars: text.length });
           return this.generationFromText({
             text: text || (last?.text ?? JSON.stringify(last ?? {})),

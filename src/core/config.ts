@@ -1,10 +1,25 @@
 import path from "node:path";
+import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { AppConfig, PeerId } from "./types.js";
 
-export const VERSION = "2.3.3";
-export const RELEASE_DATE = "2026-04-30";
+// v2.4.0 / audit closure (P3.12): tilde expansion for env-provided paths.
+// `path.resolve` does NOT expand `~` to the user's home directory on any
+// platform — operators routinely write `~/sessions` in env files and end
+// up with a literal `~` directory. We honor `~`, `~/...`, and `~\...`
+// (Windows) before resolving. The shell's `~user` syntax is intentionally
+// NOT supported because it would require a passwd lookup.
+function expandHome(rawPath: string): string {
+  if (rawPath === "~") return os.homedir();
+  if (rawPath.startsWith("~/") || rawPath.startsWith("~\\")) {
+    return path.join(os.homedir(), rawPath.slice(2));
+  }
+  return rawPath;
+}
+
+export const VERSION = "2.4.0";
+export const RELEASE_DATE = "2026-05-02";
 export const DEFAULT_MAX_OUTPUT_TOKENS = 20_000;
 const COST_RATE_ENV_PREFIX: Record<PeerId, string> = {
   codex: "CROSS_REVIEW_OPENAI",
@@ -117,7 +132,7 @@ function reasoningEffort(
 export function loadConfig(): AppConfig {
   const configuredDataDir = envValue("CROSS_REVIEW_V2_DATA_DIR");
   const dataDir = configuredDataDir
-    ? path.resolve(configuredDataDir)
+    ? path.resolve(expandHome(configuredDataDir))
     : path.join(PROJECT_ROOT, "data");
 
   return {

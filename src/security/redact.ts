@@ -11,6 +11,13 @@ const SECRET_PATTERNS = [
   /AKIA[A-Z0-9]{16}/g,
   /Bearer\s+[A-Za-z0-9._-]{20,}/gi,
   /[A-Za-z0-9_-]{32,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}/g,
+  // v2.4.0 / audit closure: env-style assignments. Catches `PASSWORD=value`
+  // / `API_KEY="value"` / `SECRET: value` / `Authorization: token` shapes
+  // that providers, smoke fixtures or stack traces sometimes echo back.
+  // The replacement preserves the key name so audit consumers see WHICH
+  // var was redacted, only the value is replaced. Mirrors the pattern in
+  // v1's `REDACTION_PATTERNS`.
+  /\b((?:password|passwd|api[_-]?key|secret|token|access[_-]?key|auth(?:orization)?|bearer|private[_-]?key)\s*[:=]\s*["']?)([^\s"',}]{6,})/gi,
 ];
 
 const PRIVATE_KEY_LABELS = [
@@ -95,7 +102,23 @@ function redactPrivateKeyBlocks(value: string): string {
 
 export function redact(value: string): string {
   let output = redactPrivateKeyBlocks(value);
-  for (const re of SECRET_PATTERNS) output = output.replace(re, "[REDACTED]");
+  for (const re of SECRET_PATTERNS) {
+    // The env-style assignment pattern uses two capture groups so that
+    // the key name is preserved; the standalone-token patterns do not
+    // capture and we replace the whole match. We dispatch on the regex
+    // shape (`re.source.includes("(")`) but the safer signal is the
+    // number of groups we declared — both env-style and JWT use groups,
+    // but only the env-style declares two ((key)(value)). For the JWT
+    // pattern we still replace the whole match because there is no key
+    // half to preserve.
+    output = output.replace(re, (...args) => {
+      const groups = args.slice(1, -2).filter((g) => typeof g === "string");
+      if (groups.length >= 2) {
+        return `${groups[0]}[REDACTED]`;
+      }
+      return "[REDACTED]";
+    });
+  }
   return output;
 }
 

@@ -10,7 +10,7 @@ import type {
   TokenUsage,
 } from "../core/types.js";
 import { statusInstruction } from "../core/status.js";
-import { BasePeerAdapter } from "./base.js";
+import { BasePeerAdapter, StreamBuffer } from "./base.js";
 import { classifyProviderError } from "./errors.js";
 import { withRetry } from "./retry.js";
 import { userPrompt } from "./text.js";
@@ -158,7 +158,7 @@ export class DeepSeekAdapter extends BasePeerAdapter implements PeerAdapter {
             signal: context.signal,
             timeout: this.config.retry.timeout_ms,
           });
-          let text = "";
+          const stream_buffer = new StreamBuffer(this.id);
           let usage: TokenUsage | undefined;
           let modelReported: string | undefined;
           let chunks = 0;
@@ -168,7 +168,7 @@ export class DeepSeekAdapter extends BasePeerAdapter implements PeerAdapter {
             usage = usageFromChat(chunk.usage) ?? usage;
             for (const choice of chunk.choices ?? []) {
               const delta = choice.delta?.content ?? "";
-              text += delta;
+              stream_buffer.append(delta);
               this.emitTokenDelta(context, {
                 phase: "review",
                 delta,
@@ -176,6 +176,7 @@ export class DeepSeekAdapter extends BasePeerAdapter implements PeerAdapter {
               });
             }
           }
+          const text = stream_buffer.text();
           this.emitTokenCompleted(context, { phase: "review", chars: text.length });
           return this.resultFromText({
             text,
@@ -237,7 +238,7 @@ export class DeepSeekAdapter extends BasePeerAdapter implements PeerAdapter {
             signal: context.signal,
             timeout: this.config.retry.timeout_ms,
           });
-          let text = "";
+          const stream_buffer = new StreamBuffer(this.id);
           let usage: TokenUsage | undefined;
           let modelReported: string | undefined;
           let chunks = 0;
@@ -247,7 +248,7 @@ export class DeepSeekAdapter extends BasePeerAdapter implements PeerAdapter {
             usage = usageFromChat(chunk.usage) ?? usage;
             for (const choice of chunk.choices ?? []) {
               const delta = choice.delta?.content ?? "";
-              text += delta;
+              stream_buffer.append(delta);
               this.emitTokenDelta(context, {
                 phase: "generation",
                 delta,
@@ -255,6 +256,7 @@ export class DeepSeekAdapter extends BasePeerAdapter implements PeerAdapter {
               });
             }
           }
+          const text = stream_buffer.text();
           this.emitTokenCompleted(context, { phase: "generation", chars: text.length });
           return this.generationFromText({
             text,

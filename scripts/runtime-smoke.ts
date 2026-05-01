@@ -9,6 +9,9 @@ const transport = new StdioClientTransport({
   env: {
     ...process.env,
     CROSS_REVIEW_V2_STUB: process.env.CROSS_REVIEW_V2_STUB ?? "1",
+    // v2.4.0 / audit closure (P1.1): runtime smoke is a legitimate stub
+    // consumer; opt in to the double-confirmation gate.
+    CROSS_REVIEW_V2_STUB_CONFIRMED: process.env.CROSS_REVIEW_V2_STUB_CONFIRMED ?? "1",
     CROSS_REVIEW_V2_MAX_SESSION_COST_USD:
       process.env.CROSS_REVIEW_V2_MAX_SESSION_COST_USD ?? "1000",
     CROSS_REVIEW_V2_PREFLIGHT_MAX_ROUND_COST_USD:

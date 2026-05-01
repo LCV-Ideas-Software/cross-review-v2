@@ -10,7 +10,7 @@ import type {
   TokenUsage,
 } from "../core/types.js";
 import { statusInstruction, statusJsonSchema } from "../core/status.js";
-import { BasePeerAdapter } from "./base.js";
+import { BasePeerAdapter, StreamBuffer } from "./base.js";
 import { classifyProviderError } from "./errors.js";
 import { withRetry } from "./retry.js";
 import { textFromOpenAIResponse, userPrompt } from "./text.js";
@@ -144,7 +144,7 @@ export class OpenAIAdapter extends BasePeerAdapter implements PeerAdapter {
           max_output_tokens: this.config.max_output_tokens,
         };
         if (this.shouldStreamTokens(context)) {
-          let text = "";
+          const stream_buffer = new StreamBuffer(this.id);
           let usage: TokenUsage | undefined;
           let modelReported: string | undefined;
           const stream = await this.client().responses.create(
@@ -154,7 +154,7 @@ export class OpenAIAdapter extends BasePeerAdapter implements PeerAdapter {
           for await (const event of stream as AsyncIterable<OpenAIStreamEvent>) {
             if (event.type === "response.output_text.delta") {
               const delta = typeof event.delta === "string" ? event.delta : "";
-              text += delta;
+              stream_buffer.append(delta);
               this.emitTokenDelta(context, {
                 phase: "review",
                 delta,
@@ -171,6 +171,7 @@ export class OpenAIAdapter extends BasePeerAdapter implements PeerAdapter {
               throw new Error(message ?? "OpenAI streaming response failed.");
             }
           }
+          const text = stream_buffer.text();
           this.emitTokenCompleted(context, { phase: "review", chars: text.length });
           return this.resultFromText({
             text,
@@ -222,7 +223,7 @@ export class OpenAIAdapter extends BasePeerAdapter implements PeerAdapter {
           max_output_tokens: this.config.max_output_tokens,
         };
         if (this.shouldStreamTokens(context)) {
-          let text = "";
+          const stream_buffer = new StreamBuffer(this.id);
           let usage: TokenUsage | undefined;
           let modelReported: string | undefined;
           const stream = await this.client().responses.create(
@@ -232,7 +233,7 @@ export class OpenAIAdapter extends BasePeerAdapter implements PeerAdapter {
           for await (const event of stream as AsyncIterable<OpenAIStreamEvent>) {
             if (event.type === "response.output_text.delta") {
               const delta = typeof event.delta === "string" ? event.delta : "";
-              text += delta;
+              stream_buffer.append(delta);
               this.emitTokenDelta(context, {
                 phase: "generation",
                 delta,
@@ -249,6 +250,7 @@ export class OpenAIAdapter extends BasePeerAdapter implements PeerAdapter {
               throw new Error(message ?? "OpenAI streaming response failed.");
             }
           }
+          const text = stream_buffer.text();
           this.emitTokenCompleted(context, { phase: "generation", chars: text.length });
           return this.generationFromText({
             text,

@@ -9,6 +9,56 @@ standard `v00.00.00`; npm package versions remain SemVer.
 
 _No entries yet._
 
+## [v02.04.00] - 2026-05-02
+
+**Audit-closure hardening pass.** Closes 18 priorities + 5 misc items from the internal v2.3.3 technical opinion audit. Mirrors the v1 v1.6.7 cycle. Additive within the v2.x public surface plus three behavioral changes flagged below.
+
+### Added
+
+- **`STREAM_TEXT_MAX_BYTES = 16 MiB` per peer call.** Anthropic, OpenAI, Gemini and DeepSeek streaming buffers now reject responses that exceed the cap before the SDK materializes the final message. The retry layer classifies the overflow as a regular failure so the caller observes a structured rejection instead of an OOM.
+- **`StreamBuffer` class in `peers/base.ts`** with O(1) per-append byte accounting (running counter; never re-scans the accumulated buffer). Refined after cross-review-v2 R3 caught an O(N²) regression in the initial `appendStreamText` shim. The shim is preserved for stateless callers but production adapters use the class form.
+- **`SessionStore.sweepOrphanTmpFiles()`** removes `*.<pid>.<ts>.<nonce>.tmp` artifacts left behind by interrupted writes (P1.3 companion).
+- **`SessionStore.clearStaleInFlight()`** clears `meta.in_flight` when the lock holder PID is dead OR `started_at > 30 min`. Wired into `mcp/server.ts` boot path alongside `sweepOrphanTmpFiles`.
+- **MCP tool schema caps.** `task` (32 KiB), `draft` (200 KiB), `initial_draft` (200 KiB) now declare `.max()` so oversized inputs are rejected at the schema layer before the parser/spawn/persistence layers touch them.
+- **`MAX_PAYLOAD_BYTES = 64 KiB` byte-level guard before `JSON.parse`** in `core/status.ts`. Hostile peers can no longer OOM the orchestrator with a giant `<cross_review_status>` block.
+- **Retry-After header extraction.** `errors.ts` now reads `Retry-After` from `error.headers` (fetch shape) and `error.response.headers` (legacy shape) and populates `failure.retry_after_ms`. The retry loop already consumes that field.
+- **5xx gateway errors are retryable.** 502/503/504 transient gateway responses are no longer collapsed into the generic `provider_error` non-retryable class.
+- **`AbortSignal` propagation in Gemini.** Both `call()` and `generate()` now pass `context.signal` to the GoogleGenAI SDK, so `session_cancel_job` can interrupt in-flight Gemini requests instead of waiting for the natural response.
+- **Boot stub double-confirmation (fail-fast).** `CROSS_REVIEW_V2_STUB=1` alone now THROWS at startup; activation requires `NODE_ENV=test` OR `CROSS_REVIEW_V2_STUB_CONFIRMED=1`. Guards production deploys against accidental stub activation via stray dotenv variables AND preserves operator intent — flag-only users (local dev, CI offline, budget kill) are NOT silently billed for real provider calls. Refined after cross-review-v2 R1 caught a financial-safety regression in the initial fallback design.
+- **`SECURITY.md` Threat Model section.** Documents the single-user trusted-host assumption, multi-host concurrency caveats, dashboard binding, stub safety, schema caps, streaming caps and `OPENAI_BASE_URL` precedence.
+- **Dashboard CSP + clickjacking headers.** The HTML response now ships `Content-Security-Policy`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`.
+- **Format-recovery quota.** Per-session cap of 6 recoveries; subsequent peer parser failures report `failure_class: "format_recovery_exhausted"` instead of triggering more paid recovery calls.
+
+### Fixed
+
+- **`atomicWriteFile` retry on Windows.** Pre-v2.4.0 `fs.renameSync` failures with `EPERM`/`EACCES`/`EBUSY`/`EEXIST` left orphan `.tmp` files in the session directory. v2.4.0 retries with backoff (10/20/40/80/160 ms × 5), adds a `crypto.randomBytes(2)` nonce to the tmp filename, and unlinks the tmp on terminal failure. Mirrors v1 v1.6.7 P1.2.
+- **`JSON.parse` failures now contextualized.** `readJson()` wraps parse errors with the source file path so audit consumers see WHICH file is malformed instead of a bare `SyntaxError`.
+- **`SessionIdSchema` lowercase normalization.** UUIDv4 regex was already case-insensitive but zod did not normalize the output. v2.4.0 transforms to lowercase before downstream consumers see the value, eliminating the TOCTOU surface on case-sensitive filesystems.
+- **`CROSS_REVIEW_V2_DATA_DIR` tilde expansion.** `~`, `~/...` and `~\...` are now expanded to `os.homedir()` before `path.resolve()`.
+- **Retry backoff jitter.** `retry.ts` now applies full jitter (random in [0, capped]) to the exponential backoff so concurrent peers hitting the same provider do not synchronize their retries (thundering herd).
+- **Convergence strict equality.** `p.status == null` (loose) replaced with `=== null || === undefined` so a future code path producing `""` or `0` would not be misclassified as `NEEDS_EVIDENCE`.
+- **Model-selection nullish coalescing.** `config.models[peer] || PRIORITY[peer][0]` replaced with `??` so an explicit `null` fallback is preserved.
+- **`appendEvent` in-memory monotonic seq counter.** Pre-v2.4.0 `seq` was recomputed by reading + counting the events file inside the session lock; the counter is now cached per session_id and incremented strictly monotonically. Restart re-initializes from disk.
+- **`redact()` env-style assignments.** Patterns like `PASSWORD=value`, `API_KEY: token`, `Authorization: Bearer ...` are now redacted while preserving the key name for audit observability.
+- **Cost preflight includes retry/fallback amplification.** `estimatedPeerRoundCost` multiplies by `min(4, retry.max_attempts + len(fallback_models))` so the budget gate is conservative against the worst-case retry chain.
+- **Model-selection env override validation.** Overrides outside the documented PRIORITY list are honored but flagged with `confidence: "inferred"` so a typo surfaces here instead of as a provider 404 mid-round.
+
+### Behavioral changes (operator-visible)
+
+- `CROSS_REVIEW_V2_STUB=1` alone now BOOTS WITH REAL ADAPTERS. Set `NODE_ENV=test` or `CROSS_REVIEW_V2_STUB_CONFIRMED=1` to opt in deliberately. Stderr prints a loud notice for both paths.
+- `convergence_scope` enum unchanged (no new values introduced — equivalent to v1 v1.6.7 P2.6 wisdom that adding a new prefix would break enum-validating consumers).
+- Session ids returned from MCP tools are always lowercase (case-insensitive UUIDs accepted, lowercase output).
+
+### Validation
+
+- `npm run format:check`
+- `npm run lint`
+- `npm test` (build + smoke + runtime-smoke).
+
+### Pre-commit cross-review
+
+- Cross-review-v2 quadrilateral session `13690e71-7205-4b46-837d-7da9091d89b6` converged READY after 6 rounds (caller=claude, peers=codex+gemini+deepseek). Codex (original v2 author) raised five successive rigorous blockers across R1–R5: financial-safety regression in initial stub gate (later flagged stronger by gemini), pre-allocation byte check ordering, seq cache durability, format-recovery concurrency, and finally an unconditional `markInFlight` overwrite that allowed concurrent same-session ask_peers to race the recovery counter. R5 added an explicit `if (meta.in_flight) throw` guard inside `markInFlight` and a `mark_in_flight_concurrency_guard_test` smoke marker. Final outcome: `unanimous_ready` with codex/gemini/deepseek READY and decision_quality clean across all three. New smoke markers visible in CI: `session_id_schema_lowercase_test: PASS`, `stream_buffer_overflow_test: PASS`, `seq_cache_append_failure_restart_test: PASS`, `mark_in_flight_concurrency_guard_test: PASS`.
+
 ## [v02.03.03] - 2026-04-30
 
 ### Fixed

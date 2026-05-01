@@ -27,15 +27,72 @@ function now(): string {
   return new Date().toISOString();
 }
 
+// v2.4.0 / audit closure (P1.3): atomicWriteFile retry on Windows.
+// `fs.renameSync` in Win32 fails with EPERM/EACCES/EBUSY when the
+// destination is briefly held by another handle (AV scan, indexing,
+// concurrent reader). Pre-v2.4.0 the rename threw and left the .tmp
+// orphaned in the session directory. Now we (a) try rename, (b) on
+// transient EPERM/EACCES/EBUSY/EEXIST retry up to 5 times with short
+// backoff, (c) on terminal failure clean up the tmp file ourselves so
+// the session directory does not accumulate `*.tmp` artifacts, (d)
+// re-throw the last error so the caller still observes the failure.
+// Mirrors the v1.6.7 P1.2 fix.
+const ATOMIC_WRITE_RETRY_CODES = new Set(["EPERM", "EACCES", "EBUSY", "EEXIST"]);
+const ATOMIC_WRITE_MAX_ATTEMPTS = 5;
+const TMP_NONCE_BYTES = 2;
+
 function writeJson(file: string, data: unknown): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  const nonce = crypto.randomBytes(TMP_NONCE_BYTES).toString("hex");
+  const tmp = `${file}.${process.pid}.${Date.now()}.${nonce}.tmp`;
   fs.writeFileSync(tmp, redact(`${JSON.stringify(data, null, 2)}\n`), "utf8");
-  fs.renameSync(tmp, file);
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt < ATOMIC_WRITE_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      fs.renameSync(tmp, file);
+      return;
+    } catch (err) {
+      lastErr = err;
+      const code = (err as NodeJS.ErrnoException).code;
+      if (!code || !ATOMIC_WRITE_RETRY_CODES.has(code)) break;
+      const wait = 10 * 2 ** attempt; // 10, 20, 40, 80, 160 ms
+      const start = Date.now();
+      while (Date.now() - start < wait) {
+        /* spin — sync write path, brief by design */
+      }
+    }
+  }
+  // Terminal failure path: best-effort tmp cleanup so callers don't see
+  // the orphan accumulate even when the write itself failed.
+  try {
+    fs.unlinkSync(tmp);
+  } catch {
+    /* ignore */
+  }
+  throw lastErr;
 }
 
+// v2.4.0 / audit closure (P1.3 companion): boot sweep of orphan .tmp files.
+// Crashes inside writeJson (between writeFileSync and renameSync) leave
+// files matching `<basename>.<pid>.<ts>.<nonce>.tmp` in the session
+// directory. They are never read but should not accumulate. Walk every
+// session dir at boot, drop files matching the .tmp pattern whose holder
+// pid is dead OR whose timestamp is older than 1h. Idempotent +
+// best-effort.
+const TMP_FILE_PATTERN = /\.(\d+)\.(\d+)\.[0-9a-f]+\.tmp$/;
+const TMP_STALE_AFTER_MS = 60 * 60 * 1000; // 1h
+
 function readJson<T>(file: string): T {
-  return JSON.parse(fs.readFileSync(file, "utf8")) as T;
+  // v2.4.0 / audit closure: contextualize JSON.parse failures so callers see
+  // which file is malformed rather than a bare SyntaxError. Read errors
+  // still propagate naturally (ENOENT, EACCES) so caller can branch.
+  const raw = fs.readFileSync(file, "utf8");
+  try {
+    return JSON.parse(raw) as T;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`failed to parse JSON at ${file}: ${message}`, { cause: err });
+  }
 }
 
 function safeFilePart(value: string): string {
@@ -52,6 +109,17 @@ function timestampFilePart(): string {
 }
 
 export class SessionStore {
+  // v2.4.0 / audit closure (P3.13): in-memory monotonic seq counter per
+  // session. Pre-v2.4.0 appendEvent recomputed seq by reading the events
+  // file, splitting on newlines and counting non-empty lines — that race
+  // remained even inside withSessionLock because two emit calls within
+  // the same process could compute identical seqs if the OS write returned
+  // before the next read. The cache below is initialized on first use
+  // (lazy) by reading the existing file ONCE and is incremented strictly
+  // monotonically thereafter. Restart re-initializes from disk, so seq
+  // remains correct across process boundaries.
+  private readonly seqCache = new Map<string, number>();
+
   constructor(private readonly config: AppConfig) {
     fs.mkdirSync(this.sessionsDir(), { recursive: true });
   }
@@ -196,6 +264,15 @@ export class SessionStore {
     return meta;
   }
 
+  // v2.4.0 / cross-review-v2 R5 (codex blocker): refuse to overwrite an
+  // existing in_flight when starting a new round. Pre-R5 markInFlight
+  // unconditionally clobbered `meta.in_flight`, so a second concurrent
+  // ask_peers on the same session would silently steamroll the first
+  // round's state — and the format-recovery quota counter would race
+  // because both calls could read the same `recoveriesAlready` baseline.
+  // R5 throws when in_flight is already populated; the boot-time
+  // `clearStaleInFlight` sweep clears any orphan in_flight from a
+  // crashed prior host so legitimate operators are not blocked.
   markInFlight(
     sessionId: string,
     params: {
@@ -207,6 +284,11 @@ export class SessionStore {
   ): SessionMeta {
     return this.withSessionLock(sessionId, () => {
       const meta = this.read(sessionId);
+      if (meta.in_flight) {
+        throw new Error(
+          `session ${sessionId} already has an in-flight round (round=${meta.in_flight.round}, started_at=${meta.in_flight.started_at}); refusing to start a concurrent round. Wait for the round to complete, cancel it via session_cancel_job, or recover it via session_recover_interrupted.`,
+        );
+      }
       meta.in_flight = {
         round: params.round,
         peers: params.peers,
@@ -229,23 +311,57 @@ export class SessionStore {
     return readJson<SessionMeta>(this.metaPath(sessionId));
   }
 
+  // v2.4.0 / audit closure (P3.13) — refined after cross-review-v2 R2 (codex
+  // caught a durability gap in the initial implementation).
+  //
+  // Pre-R2: the cache was incremented BEFORE appendFileSync. If the
+  // append failed (ENOSPC, EACCES, write-error mid-call) the cache held
+  // an already-handed-out seq number that nothing on disk consumed —
+  // and a subsequent successful append would reuse the same disk byte
+  // for a different event, while the cache produced seq+1. After
+  // process restart the cache rebuild re-counted lines and produced a
+  // duplicate seq.
+  //
+  // R2 (codex): the cache is updated ONLY after the appendFileSync
+  // returns. If append throws, the cache is unchanged so the next call
+  // reuses the same intended seq (no gap, no duplicate). On restart
+  // the cache rebuild reflects on-disk reality. The lazy load uses
+  // line count of the existing file as a reasonable approximation of
+  // the durable max-seq.
+  private peekNextSeq(sessionId: string, file: string): number {
+    let cached = this.seqCache.get(sessionId);
+    if (cached === undefined) {
+      try {
+        cached = fs.readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean).length;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        cached = 0;
+      }
+      this.seqCache.set(sessionId, cached);
+    }
+    return cached + 1;
+  }
+
+  private commitSeq(sessionId: string, committed: number): void {
+    this.seqCache.set(sessionId, committed);
+  }
+
   appendEvent(event: RuntimeEvent): void {
     const sessionId = event.session_id;
     if (!sessionId) return;
     try {
       this.withSessionLock(sessionId, () => {
         const file = this.eventsPath(sessionId);
-        let seq = 1;
-        try {
-          seq = fs.readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean).length + 1;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        }
+        const seq = this.peekNextSeq(sessionId, file);
         fs.appendFileSync(
           file,
           `${JSON.stringify({ ...event, seq, ts: event.ts ?? now() })}\n`,
           "utf8",
         );
+        // Only commit the cache AFTER the durable append succeeded.
+        // If appendFileSync threw above, the cache still reflects the
+        // last persisted seq and the next call reuses this seq number.
+        this.commitSeq(sessionId, seq);
       });
     } catch {
       // Event persistence must never break provider calls or MCP responses.
@@ -660,5 +776,109 @@ export class SessionStore {
       swept.push(finalized);
     }
     return swept;
+  }
+
+  // v2.4.0 / audit closure (P1.3 companion): boot sweep of orphan .tmp
+  // files. Crashes inside writeJson (between writeFileSync and renameSync)
+  // leave files matching `<basename>.<pid>.<ts>.<nonce>.tmp` in the session
+  // directory. Walk every session dir at boot, drop files matching the
+  // .tmp pattern whose holder pid is dead OR whose timestamp is older than
+  // 1h. Idempotent + best-effort. Returns counts for telemetry.
+  sweepOrphanTmpFiles(): { scanned: number; removed: number } {
+    let scanned = 0;
+    let removed = 0;
+    const root = this.sessionsDir();
+    if (!fs.existsSync(root)) return { scanned, removed };
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch {
+      return { scanned, removed };
+    }
+    for (const ent of entries) {
+      if (!ent.isDirectory()) continue;
+      const sessionPath = path.join(root, ent.name);
+      let files: string[];
+      try {
+        files = fs.readdirSync(sessionPath);
+      } catch {
+        continue;
+      }
+      for (const f of files) {
+        const m = TMP_FILE_PATTERN.exec(f);
+        if (!m) continue;
+        scanned += 1;
+        const tmpPid = Number.parseInt(m[1] ?? "", 10);
+        const tmpTs = Number.parseInt(m[2] ?? "", 10);
+        const tmpAge = Date.now() - tmpTs;
+        const holderAlive = Number.isInteger(tmpPid) ? this.processAlive(tmpPid) : false;
+        if (!holderAlive || tmpAge > TMP_STALE_AFTER_MS) {
+          try {
+            fs.unlinkSync(path.join(sessionPath, f));
+            removed += 1;
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    }
+    return { scanned, removed };
+  }
+
+  // v2.4.0 / audit closure (P3.11): clear stale meta.in_flight at boot.
+  // `markInFlight` sets meta.in_flight before each round and clearInFlight
+  // is supposed to clear it on resolve/reject. If the host crashes
+  // mid-spawn, in_flight stays set forever — confusing audit consumers
+  // and `recoverInterruptedSessions` consumers that read it as "round in
+  // progress". sweepIdle clears in_flight only after 24h idle (footgun
+  // floor). This companion sweep covers the common host-crash case where
+  // we want to reconcile in_flight as soon as the new boot starts, not
+  // after a day. Conditions to clear:
+  //   - holder pid (lock holder, if any) is dead, OR
+  //   - in_flight.started_at is older than HEARTBEAT_STALE_AFTER_MS.
+  // Sessions still actively running on a live PID are skipped. Idempotent
+  // + best-effort. Returns counts for telemetry.
+  clearStaleInFlight(): { scanned: number; cleared: number } {
+    const HEARTBEAT_STALE_AFTER_MS = 30 * 60 * 1000; // 30 minutes
+    let scanned = 0;
+    let cleared = 0;
+    for (const session of this.list()) {
+      if (!session.in_flight) continue;
+      scanned += 1;
+      const startedIso = session.in_flight.started_at;
+      const startedAge = startedIso ? Date.now() - Date.parse(startedIso) : Infinity;
+      // Best-effort liveness probe via the active lock holder pid (if any).
+      let holderAlive = true;
+      const lockPath = path.join(this.sessionDir(session.session_id), ".lock");
+      if (fs.existsSync(lockPath)) {
+        try {
+          const lock = readJson<{ pid?: number }>(lockPath);
+          if (Number.isInteger(lock.pid)) {
+            holderAlive = this.processAlive(lock.pid as number);
+          }
+        } catch {
+          // malformed lock — assume dead so the lock sweep cleans it up.
+          holderAlive = false;
+        }
+      } else {
+        // No active lock — heartbeat staleness is the only signal.
+        holderAlive = !Number.isFinite(startedAge) ? false : startedAge <= HEARTBEAT_STALE_AFTER_MS;
+      }
+      if (!holderAlive || startedAge > HEARTBEAT_STALE_AFTER_MS) {
+        try {
+          this.withSessionLock(session.session_id, () => {
+            const current = this.read(session.session_id);
+            if (!current.in_flight) return;
+            delete current.in_flight;
+            current.updated_at = now();
+            writeJson(this.metaPath(session.session_id), current);
+            cleared += 1;
+          });
+        } catch {
+          /* best-effort */
+        }
+      }
+    }
+    return { scanned, cleared };
   }
 }

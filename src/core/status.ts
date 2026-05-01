@@ -5,6 +5,14 @@ const STATUS_VALUES = ["READY", "NOT_READY", "NEEDS_EVIDENCE"] as const satisfie
 const CONFIDENCE_VALUES = ["verified", "inferred", "unknown"] as const;
 const MAX_FIELD_LENGTH = 800;
 const MAX_ARRAY_ITEMS = 30;
+// v2.4.0 / audit closure (P1.4): byte-level cap on each candidate JSON
+// payload BEFORE JSON.parse. The legitimate envelope carries status +
+// summary + a handful of optional fields, all bounded by MAX_FIELD_LENGTH.
+// 64 KiB is two orders of magnitude above that and lets pathological
+// inputs (a hostile peer emitting a giant `<cross_review_status>` block)
+// be rejected as malformed before the parser allocates the AST. Mirrors
+// the v1.6.7 P1.4 fix.
+const MAX_PAYLOAD_BYTES = 64 * 1024;
 
 export const statusSchema = z.object({
   status: z.enum(["READY", "NOT_READY", "NEEDS_EVIDENCE"]),
@@ -177,6 +185,14 @@ export function parsePeerStatus(text: string): {
   if (lastBrace >= 0) candidates.push({ json: trimmed.slice(lastBrace), source: "last_brace" });
 
   for (const candidate of candidates) {
+    // v2.4.0 / audit closure (P1.4): reject oversized candidate before
+    // JSON.parse so a hostile peer can't OOM the orchestrator with a giant
+    // structured block. Byte-level (Buffer.byteLength) so multi-byte
+    // UTF-8 doesn't slip past a char-length check.
+    if (Buffer.byteLength(candidate.json, "utf8") > MAX_PAYLOAD_BYTES) {
+      warnings.push(`status_candidate_dropped_oversized:${candidate.source}`);
+      continue;
+    }
     try {
       const json = JSON.parse(candidate.json) as unknown;
       const parsed = statusSchema.safeParse(json);

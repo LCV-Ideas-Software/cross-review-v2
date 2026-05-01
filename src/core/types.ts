@@ -121,6 +121,8 @@ export interface PeerFailure {
     | "budget_preflight"
     | "cancelled"
     | "fallback_exhausted"
+    | "format_recovery_exhausted"
+    | "stream_buffer_overflow"
     | "unknown";
   message: string;
   retryable: boolean;

@@ -10,7 +10,7 @@ import type {
   TokenUsage,
 } from "../core/types.js";
 import { statusInstruction, statusJsonSchema } from "../core/status.js";
-import { BasePeerAdapter } from "./base.js";
+import { BasePeerAdapter, STREAM_TEXT_MAX_BYTES, StreamBufferOverflowError } from "./base.js";
 import { classifyProviderError } from "./errors.js";
 import { withRetry } from "./retry.js";
 import { textFromAnthropicContent, userPrompt } from "./text.js";
@@ -134,14 +134,26 @@ export class AnthropicAdapter extends BasePeerAdapter implements PeerAdapter {
           },
         };
         if (this.shouldStreamTokens(context)) {
+          // v2.4.0 / audit closure (P2.9): track streamed-text bytes
+          // incrementally so a hostile or buggy peer cannot silently
+          // accumulate gigabytes inside the SDK before finalMessage()
+          // resolves. We cannot interrupt the SDK's internal buffer
+          // directly, but throwing on overflow propagates through the
+          // promise chain and the retry layer classifies the failure.
           const stream = this.client().messages.stream(body, { signal: context.signal });
-          stream.on("text", (delta) =>
+          let streamedBytes = 0;
+          stream.on("text", (delta) => {
+            streamedBytes += Buffer.byteLength(delta, "utf8");
+            if (streamedBytes > STREAM_TEXT_MAX_BYTES) {
+              stream.controller.abort();
+              throw new StreamBufferOverflowError(this.id, streamedBytes);
+            }
             this.emitTokenDelta(context, {
               phase: "review",
               delta,
               source: "content_block_delta.text_delta",
-            }),
-          );
+            });
+          });
           const message = await stream.finalMessage();
           const text = textFromAnthropicContent(message.content);
           this.emitTokenCompleted(context, { phase: "review", chars: text.length });
@@ -193,13 +205,19 @@ export class AnthropicAdapter extends BasePeerAdapter implements PeerAdapter {
         };
         if (this.shouldStreamTokens(context)) {
           const stream = this.client().messages.stream(body, { signal: context.signal });
-          stream.on("text", (delta) =>
+          let streamedBytes = 0;
+          stream.on("text", (delta) => {
+            streamedBytes += Buffer.byteLength(delta, "utf8");
+            if (streamedBytes > STREAM_TEXT_MAX_BYTES) {
+              stream.controller.abort();
+              throw new StreamBufferOverflowError(this.id, streamedBytes);
+            }
             this.emitTokenDelta(context, {
               phase: "generation",
               delta,
               source: "content_block_delta.text_delta",
-            }),
-          );
+            });
+          });
           const message = await stream.finalMessage();
           const text = textFromAnthropicContent(message.content);
           this.emitTokenCompleted(context, { phase: "generation", chars: text.length });

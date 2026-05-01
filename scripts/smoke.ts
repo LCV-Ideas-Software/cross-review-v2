@@ -16,6 +16,10 @@ import { StubAdapter } from "../src/peers/stub.js";
 import { redact } from "../src/security/redact.js";
 
 process.env.CROSS_REVIEW_V2_STUB = "1";
+// v2.4.0 / audit closure (P1.1): stub activation requires explicit
+// double-confirmation. The smoke suite is the canonical legitimate
+// consumer of stubs and confirms here.
+process.env.CROSS_REVIEW_V2_STUB_CONFIRMED = "1";
 process.env.CROSS_REVIEW_V2_DATA_DIR =
   process.env.CROSS_REVIEW_V2_DATA_DIR ||
   path.join(os.tmpdir(), `cross-review-v2-smoke-${Date.now()}`);
@@ -741,7 +745,7 @@ assert.equal(typeof recoveryCostAlert.data?.estimated_extra_cost_usd, "number");
 const tokenDelta = eventful.find((event) => event.type === "peer.token.delta");
 assert.ok(tokenDelta);
 assert.equal(typeof tokenDelta.data?.chars, "number");
-assert.equal(Object.prototype.hasOwnProperty.call(tokenDelta.data ?? {}, "delta"), false);
+assert.equal(Object.hasOwn(tokenDelta.data ?? {}, "delta"), false);
 
 const directStreamEvents: Array<{ type: string; data?: Record<string, unknown> }> = [];
 const directStub = new StubAdapter(config, "codex");
@@ -766,7 +770,181 @@ assert.deepEqual(
 const metrics = orchestrator.store.metrics();
 assert.equal(metrics.fallback_events, 1);
 assert.equal((metrics.peer_failures.cancelled ?? 0) >= 1, true);
-assert.equal(Object.prototype.hasOwnProperty.call(metrics.decision_quality, "undefined"), false);
+assert.equal(Object.hasOwn(metrics.decision_quality, "undefined"), false);
+
+// v2.4.0 / cross-review-v2 R2 (codex): SessionIdSchema lowercase
+// normalization. Verify that the schema (a) accepts uppercase UUIDv4,
+// (b) emits the lowercase form, (c) preserves the existing UUIDv4
+// validation gate (rejects non-UUIDv4 input).
+{
+  const { SessionIdSchema } = await import("../src/mcp/server.js");
+  const upper = "ABCDEF12-3456-4789-A123-456789ABCDEF";
+  const expected = upper.toLowerCase();
+  const parsed = SessionIdSchema.parse(upper);
+  assert.equal(
+    parsed,
+    expected,
+    "SessionIdSchema must lowercase uppercase UUIDv4 input (cross-review-v2 R2 codex)",
+  );
+  const lower = "12345678-9abc-4def-8123-456789abcdef";
+  assert.equal(SessionIdSchema.parse(lower), lower);
+  // Validation gate still rejects non-UUIDv4.
+  const invalidParse = SessionIdSchema.safeParse("not-a-uuid");
+  assert.equal(
+    invalidParse.success,
+    false,
+    "SessionIdSchema must reject non-UUIDv4 (validation precedes transform)",
+  );
+  console.log("[smoke] session_id_schema_lowercase_test: PASS");
+}
+
+// v2.4.0 / cross-review-v2 R3 (gemini O(N^2) regression + codex evidence
+// requests): O(1) StreamBuffer. (a) accepts deltas under cap, (b) throws
+// StreamBufferOverflowError when projected bytes exceed STREAM_TEXT_MAX_BYTES,
+// (c) does NOT scan the accumulated buffer per delta — the contract is
+// `append measures only delta`.
+{
+  const { StreamBuffer, StreamBufferOverflowError, STREAM_TEXT_MAX_BYTES } =
+    await import("../src/peers/base.js");
+  const buffer = new StreamBuffer("smoke-peer");
+  buffer.append("hello world");
+  assert.equal(buffer.text(), "hello world");
+  assert.equal(buffer.byteLength(), 11);
+  // No-op on empty delta.
+  buffer.append("");
+  assert.equal(buffer.text(), "hello world");
+  // Append until just below the cap, then push a delta that would push over.
+  const halfCap = Math.floor(STREAM_TEXT_MAX_BYTES / 2);
+  const big = new StreamBuffer("smoke-overflow");
+  big.append("x".repeat(halfCap));
+  big.append("x".repeat(halfCap - 100));
+  let overflowThrown = false;
+  try {
+    big.append("x".repeat(200));
+  } catch (err) {
+    overflowThrown = err instanceof StreamBufferOverflowError;
+  }
+  assert.equal(
+    overflowThrown,
+    true,
+    "StreamBuffer must throw StreamBufferOverflowError when projected bytes exceed cap",
+  );
+  console.log("[smoke] stream_buffer_overflow_test: PASS");
+}
+
+// v2.4.0 / cross-review-v2 R3 (codex+deepseek evidence requests): seq
+// cache durability under appendFileSync failure + restart. Approach:
+// (a) populate one event normally, (b) monkey-patch fs.appendFileSync to
+// throw, (c) attempt another emit — appendEvent silences errors, but the
+// internal cache must NOT advance, (d) restore fs, emit again — the new
+// event must reuse the seq that the failed write was holding. (e) Restart
+// the store with a fresh instance and verify the next seq matches the
+// on-disk line count + 1 (no duplicates, no gaps).
+{
+  const { SessionStore } = await import("../src/core/session-store.js");
+  const fsModule = await import("node:fs");
+  const seqStoreA = new SessionStore(config);
+  const seqMeta = seqStoreA.init("seq-durability-test", "operator", []);
+  const seqId = seqMeta.session_id;
+  // Emit a normal event.
+  seqStoreA.appendEvent({
+    type: "session.heartbeat",
+    session_id: seqId,
+    message: "first",
+  });
+  const beforeFailure = seqStoreA.readEvents(seqId);
+  assert.equal(beforeFailure.length, 1);
+  assert.equal(beforeFailure[0]?.seq, 1);
+  // Force the next append to fail.
+  const realAppend = fsModule.default.appendFileSync;
+  let interceptorFired = false;
+  fsModule.default.appendFileSync = ((..._args: unknown[]) => {
+    interceptorFired = true;
+    throw new Error("simulated EIO");
+  }) as typeof fsModule.default.appendFileSync;
+  seqStoreA.appendEvent({
+    type: "session.heartbeat",
+    session_id: seqId,
+    message: "should-fail",
+  });
+  // Restore fs and try again — the intended seq (2) must still be
+  // available, not skipped to 3.
+  fsModule.default.appendFileSync = realAppend;
+  seqStoreA.appendEvent({
+    type: "session.heartbeat",
+    session_id: seqId,
+    message: "after-recovery",
+  });
+  const afterRecovery = seqStoreA.readEvents(seqId);
+  assert.equal(afterRecovery.length, 2, "appendEvent failure must not have written a partial line");
+  assert.equal(
+    afterRecovery[1]?.seq,
+    2,
+    "seq cache must NOT advance on append failure (codex R2 / deepseek R3 contract)",
+  );
+  // Restart simulation: fresh SessionStore reads from disk and the next
+  // seq should be 3 (current line count + 1).
+  const seqStoreB = new SessionStore(config);
+  seqStoreB.appendEvent({
+    type: "session.heartbeat",
+    session_id: seqId,
+    message: "after-restart",
+  });
+  const afterRestart = seqStoreB.readEvents(seqId);
+  assert.equal(afterRestart.length, 3);
+  assert.equal(
+    afterRestart[2]?.seq,
+    3,
+    "fresh SessionStore must rebuild seq from on-disk line count (no duplicates)",
+  );
+  // Sanity: interceptor was actually invoked.
+  assert.equal(interceptorFired, true, "fs.appendFileSync interceptor must have fired");
+  console.log("[smoke] seq_cache_append_failure_restart_test: PASS");
+}
+
+// v2.4.0 / cross-review-v2 R5 (codex blocker): markInFlight refuses to
+// overwrite an existing in_flight. Same-session concurrent ask_peers
+// would otherwise race the format-recovery quota counter. The guard
+// throws a clear operator-actionable error.
+{
+  const { SessionStore } = await import("../src/core/session-store.js");
+  const flightStore = new SessionStore(config);
+  const flightMeta = flightStore.init("mark-in-flight-guard-test", "operator", []);
+  const flightId = flightMeta.session_id;
+  flightStore.markInFlight(flightId, {
+    round: 1,
+    peers: [...PEERS],
+    started_at: new Date().toISOString(),
+    scope: {
+      caller: "operator",
+      caller_status: "READY",
+      expected_peers: [...PEERS],
+      reviewer_peers: [...PEERS],
+    },
+  });
+  let secondMarkRejected = false;
+  try {
+    flightStore.markInFlight(flightId, {
+      round: 2,
+      peers: [...PEERS],
+      started_at: new Date().toISOString(),
+      scope: {
+        caller: "operator",
+        caller_status: "READY",
+        expected_peers: [...PEERS],
+        reviewer_peers: [...PEERS],
+      },
+    });
+  } catch (err) {
+    secondMarkRejected = err instanceof Error && /already has an in-flight round/.test(err.message);
+  }
+  assert.equal(
+    secondMarkRejected,
+    true,
+    "markInFlight must refuse to overwrite an existing in_flight (codex R5 contract)",
+  );
+  console.log("[smoke] mark_in_flight_concurrency_guard_test: PASS");
+}
 
 console.log(
   JSON.stringify(

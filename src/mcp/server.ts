@@ -13,12 +13,21 @@ import { safeErrorMessage } from "../security/redact.js";
 
 const PeerSchema = z.enum(PEERS);
 const ResponseFormatSchema = z.enum(["json", "markdown"]).default("json");
+// v2.4.0 / audit closure (P1.2): UUIDv4 regex was already accepting
+// case-insensitive matches via the /i flag, but zod did not normalize the
+// output. On case-sensitive filesystems (Linux, macOS) the same logical
+// session would resolve to two different on-disk paths depending on how
+// the caller capitalized the id; on Windows the read/write paths could
+// drift between contexts. The transform below collapses the value to
+// lowercase before any downstream consumer touches it, eliminating that
+// TOCTOU surface without breaking existing UUIDv4 producers.
 export const SessionIdSchema = z
   .string()
   .regex(
     /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i,
     "session_id must be a valid UUIDv4",
-  );
+  )
+  .transform((value) => value.toLowerCase());
 const ReviewFocusSchema = z
   .string()
   .trim()
@@ -28,6 +37,19 @@ const ReviewFocusSchema = z
     "Optional provider-neutral review scope anchor. This is not Claude Code's /focus UI command; it is injected as a front-loaded Review Focus prompt block for every selected peer, including OUT OF SCOPE handling for unrelated findings.",
   )
   .optional();
+
+// v2.4.0 / audit closure (P2.5): MCP input-schema caps for the high-volume
+// LLM input fields that previously only enforced `.min(1)`. The MCP
+// StdioServerTransport does not impose a per-message cap, so a misbehaving
+// caller — or any deployment that drifts off the trusted-host model — can
+// OOM the orchestrator or burn provider tokens with one large prompt. The
+// caps below are deliberately generous (an order of magnitude above the
+// in-process `config.prompt.max_*` values) so they let normal usage
+// through while rejecting obvious abuse before parser/spawn/persistence
+// touch the bytes. Mirrors the v1.6.7 P1.1 hardening.
+const SCHEMA_TASK_MAX_CHARS = 32_000;
+const SCHEMA_DRAFT_MAX_CHARS = 200_000;
+const SCHEMA_INITIAL_DRAFT_MAX_CHARS = 200_000;
 
 function textResult(value: unknown, responseFormat = "json") {
   const text =
@@ -370,9 +392,9 @@ export async function main(): Promise<void> {
       inputSchema: z
         .object({
           session_id: SessionIdSchema.optional(),
-          task: z.string().min(1),
+          task: z.string().min(1).max(SCHEMA_TASK_MAX_CHARS),
           review_focus: ReviewFocusSchema,
-          draft: z.string().min(1),
+          draft: z.string().min(1).max(SCHEMA_DRAFT_MAX_CHARS),
           caller: z.union([PeerSchema, z.literal("operator")]).default("operator"),
           caller_status: z.enum(["READY", "NOT_READY", "NEEDS_EVIDENCE"]).default("READY"),
           peers: z
@@ -403,9 +425,9 @@ export async function main(): Promise<void> {
       inputSchema: z
         .object({
           session_id: SessionIdSchema.optional(),
-          task: z.string().min(1),
+          task: z.string().min(1).max(SCHEMA_TASK_MAX_CHARS),
           review_focus: ReviewFocusSchema,
-          draft: z.string().min(1),
+          draft: z.string().min(1).max(SCHEMA_DRAFT_MAX_CHARS),
           caller: z.union([PeerSchema, z.literal("operator")]).default("operator"),
           caller_status: z.enum(["READY", "NOT_READY", "NEEDS_EVIDENCE"]).default("READY"),
           peers: z
@@ -450,9 +472,9 @@ export async function main(): Promise<void> {
         "Generate or revise a draft and continue real API peer-review rounds until unanimous READY or the configured max_rounds is reached.",
       inputSchema: z
         .object({
-          task: z.string().min(1),
+          task: z.string().min(1).max(SCHEMA_TASK_MAX_CHARS),
           review_focus: ReviewFocusSchema,
-          initial_draft: z.string().optional(),
+          initial_draft: z.string().max(SCHEMA_INITIAL_DRAFT_MAX_CHARS).optional(),
           lead_peer: PeerSchema.default("codex"),
           peers: z
             .array(PeerSchema)
@@ -485,9 +507,9 @@ export async function main(): Promise<void> {
       inputSchema: z
         .object({
           session_id: SessionIdSchema.optional(),
-          task: z.string().min(1),
+          task: z.string().min(1).max(SCHEMA_TASK_MAX_CHARS),
           review_focus: ReviewFocusSchema,
-          initial_draft: z.string().optional(),
+          initial_draft: z.string().max(SCHEMA_INITIAL_DRAFT_MAX_CHARS).optional(),
           lead_peer: PeerSchema.default("codex"),
           peers: z
             .array(PeerSchema)
@@ -885,6 +907,34 @@ export async function main(): Promise<void> {
 
   await server.connect(new StdioServerTransport());
   console.error("cross-review-v2 running on stdio");
+
+  // v2.4.0 / audit closure (P1.3 + P3.11 wiring): boot-time resilience
+  // sweeps. Run fire-and-forget AFTER the transport is connected so they
+  // do not delay the MCP initialize handshake. Both sweeps are pure
+  // filesystem walks against the configured data_dir; failures are
+  // surfaced to stderr but never propagate to the MCP client.
+  setImmediate(() => {
+    try {
+      const tmpSweep = runtime.orchestrator.store.sweepOrphanTmpFiles();
+      if (tmpSweep.scanned > 0) {
+        console.error("[cross-review-v2] startup tmp sweep:", JSON.stringify(tmpSweep));
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[cross-review-v2] startup tmp sweep error: ${message}`);
+    }
+  });
+  setImmediate(() => {
+    try {
+      const inFlightSweep = runtime.orchestrator.store.clearStaleInFlight();
+      if (inFlightSweep.scanned > 0) {
+        console.error("[cross-review-v2] startup in_flight sweep:", JSON.stringify(inFlightSweep));
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[cross-review-v2] startup in_flight sweep error: ${message}`);
+    }
+  });
 }
 
 main().catch((error) => {

@@ -386,6 +386,22 @@ function budgetExceeded(session: SessionMeta, limit?: number): boolean {
   return limit != null && total != null && total > limit;
 }
 
+// v2.4.0 / audit closure: estimatedPeerRoundCost now factors in retry
+// and fallback chains. Pre-v2.4.0 the estimate was strictly 1 call per
+// peer, so a round that triggered fallback chains or format recovery
+// could overshoot a budget that preflight had approved. We multiply
+// by `(retry.max_attempts + len(fallback_models))` so the budget gate
+// is conservative against the worst-case retry pattern. The factor is
+// capped at 4 to avoid pessimism in the common case where retries
+// rarely all fire.
+const RETRY_AMPLIFICATION_CAP = 4;
+
+function retryAmplificationFor(config: AppConfig, peer: PeerId): number {
+  const fallbackCount = (config.fallback_models[peer] ?? []).length;
+  const baseAttempts = Math.max(1, config.retry.max_attempts);
+  return Math.min(RETRY_AMPLIFICATION_CAP, baseAttempts + fallbackCount);
+}
+
 function estimatedPeerRoundCost(
   config: AppConfig,
   peers: PeerId[],
@@ -397,8 +413,9 @@ function estimatedPeerRoundCost(
     if (!rate) return undefined;
     const inputTokens = Math.ceil(prompt.length / 4);
     const outputTokens = config.max_output_tokens;
-    total += (inputTokens / 1_000_000) * rate.input_per_million;
-    total += (outputTokens / 1_000_000) * rate.output_per_million;
+    const amplification = retryAmplificationFor(config, peer);
+    total += (inputTokens / 1_000_000) * rate.input_per_million * amplification;
+    total += (outputTokens / 1_000_000) * rate.output_per_million * amplification;
   }
   return total;
 }
@@ -863,11 +880,73 @@ export class CrossReviewOrchestrator {
     const peers: PeerResult[] = [];
     const rejected: PeerFailure[] = [];
 
+    // v2.4.0 / audit closure: format-recovery quota. Pre-v2.4.0 every
+    // parser-failed response triggered a recovery + retry call (extra
+    // paid round). If a draft consistently produced unparseable peer
+    // output (peer hostility, moderation, runaway model), the cost
+    // amplification could fire on every peer in every round.
+    //
+    // We approximate a per-session cap by COUNTING `parser_warnings`
+    // entries across prior rounds that contain the recovery sentinels
+    // emitted below. This avoids an additive schema field while keeping
+    // the cap enforceable across calls. The cap is intentionally
+    // generous (6) so legitimate format hiccups recover automatically;
+    // exceeding it indicates systemic issues that should fail visibly.
+    //
+    // Concurrency note (cross-review-v2 R2 / codex): two ask_peers calls
+    // on the SAME session cannot race the recovery counter because the
+    // session's `markInFlight` (called via store.markRoundInFlight at
+    // the start of every round) acquires `withSessionLock` and refuses
+    // to mark a second round while the first is still in_flight. The
+    // second call therefore observes the first call's persisted round
+    // (and its recovery sentinels) before computing recoveriesAlready.
+    // Cross-process concurrency on the same data_dir is documented as
+    // unsupported in SECURITY.md.
+    const FORMAT_RECOVERY_PER_SESSION_CAP = 6;
+    const RECOVERY_SENTINELS = [
+      "format_recovery_retry_succeeded",
+      "format_recovery_retry_returned_no_status",
+      "decision_retry_succeeded",
+      "decision_retry_returned_no_status",
+    ];
+    let recoveriesUsedThisCall = 0;
+    const recoveriesAlready = session.rounds.reduce((sum, round) => {
+      for (const peer of round.peers) {
+        if (
+          peer.parser_warnings.some((warning) =>
+            RECOVERY_SENTINELS.some((sentinel) => warning.includes(sentinel)),
+          )
+        ) {
+          sum += 1;
+        }
+      }
+      return sum;
+    }, 0);
+
     for (const item of settled) {
       const { adapter } = item;
       if (item.result) {
         let peerResult = item.result;
         if (peerResult.status == null && peerResult.model_match !== false) {
+          const totalRecoveries = recoveriesAlready + recoveriesUsedThisCall;
+          if (totalRecoveries >= FORMAT_RECOVERY_PER_SESSION_CAP) {
+            const failure: PeerFailure = {
+              peer: peerResult.peer,
+              provider: peerResult.provider,
+              model: peerResult.model,
+              failure_class: "format_recovery_exhausted",
+              message: `Per-session format-recovery cap (${FORMAT_RECOVERY_PER_SESSION_CAP}) reached; refusing to spawn another paid recovery call.`,
+              retryable: false,
+              attempts: peerResult.attempts,
+              latency_ms: peerResult.latency_ms,
+            };
+            rejected.push(failure);
+            this.store.savePeerFailure(session.session_id, roundNumber, failure);
+            peers.push(peerResult);
+            this.store.savePeerResult(session.session_id, roundNumber, peerResult);
+            continue;
+          }
+          recoveriesUsedThisCall += 1;
           const decisionRetry = !containsReviewDecisionLexeme(peerResult.text);
           this.store.savePeerResult(
             session.session_id,

@@ -70,13 +70,24 @@ export function selectFromCandidates(
 }
 
 function overrideSelection(peer: PeerId, value: string): ModelSelection {
+  // v2.4.0 / audit closure: warn when an env override does not match any
+  // entry in the documented PRIORITY list. Pre-v2.4.0 a typo
+  // (`gpt-5.5-fast` vs `gpt-5.5`) would silently propagate to the
+  // provider and surface as a 404/invalid-model error mid-round, far
+  // from the env-config root cause. We do NOT throw — the operator may
+  // legitimately pin a model outside the maintained list — but the
+  // `confidence: "inferred"` plus the explicit notice in the reason
+  // string make the deviation observable.
+  const known = PRIORITY[peer].includes(value);
   return {
     peer,
     selected: value,
     candidates: [{ id: value, source: "env-override" }],
     source_url: DOCS[peer],
-    confidence: "verified",
-    reason: `${envOverrideName(peer)} is set; the explicit override has priority over automatic selection.`,
+    confidence: known ? "verified" : "inferred",
+    reason: known
+      ? `${envOverrideName(peer)} is set; the explicit override has priority over automatic selection.`
+      : `${envOverrideName(peer)}='${value}' is set but is not in the documented priority list (${PRIORITY[peer].join(" > ")}); honoring the operator override but flagging confidence=inferred so any provider 404 surfaces here.`,
   };
 }
 
@@ -167,7 +178,7 @@ export async function resolveBestModel(config: AppConfig, peer: PeerId): Promise
   if (!keyPresent(config, peer)) {
     return {
       peer,
-      selected: config.models[peer] || PRIORITY[peer][0],
+      selected: config.models[peer] ?? PRIORITY[peer][0],
       candidates: [],
       source_url: DOCS[peer],
       confidence: "inferred",
@@ -182,7 +193,7 @@ export async function resolveBestModel(config: AppConfig, peer: PeerId): Promise
     const message = error instanceof Error ? error.message : String(error);
     return {
       peer,
-      selected: config.models[peer] || PRIORITY[peer][0],
+      selected: config.models[peer] ?? PRIORITY[peer][0],
       candidates: [],
       source_url: DOCS[peer],
       confidence: "unknown",
