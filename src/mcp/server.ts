@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import crypto from "node:crypto";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -937,7 +939,28 @@ export async function main(): Promise<void> {
   });
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+// v2.4.0 / cross-review-v2 R6 follow-up (CI failure 25199679588): guard
+// main() so it only runs when this module is invoked as the entry point
+// (e.g. `bin/cross-review-v2` or `node dist/src/mcp/server.js`). Without
+// the guard, any module that imports a named export from here (the smoke
+// suite imports `SessionIdSchema` and `pruneCompletedJobs`) triggers a
+// full server boot at import time — and in CI that boot ran with the
+// stub flag set but without confirmation, tripping the v2.4.0 P1.1
+// fail-fast gate before scripts/smoke.ts could write the confirmation
+// env var. Comparing `import.meta.url` to `process.argv[1]` is the
+// canonical ESM "is main module" check; a side benefit is that bin
+// installs (which resolve through symlinks) still match because we
+// compare resolved paths.
+const __isMainModule = (() => {
+  if (!process.argv[1]) return false;
+  const moduleFile = fileURLToPath(import.meta.url);
+  const argvFile = path.resolve(process.argv[1]);
+  return moduleFile === argvFile;
+})();
+
+if (__isMainModule) {
+  main().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+}

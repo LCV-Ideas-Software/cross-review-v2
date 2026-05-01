@@ -9,6 +9,20 @@ standard `v00.00.00`; npm package versions remain SemVer.
 
 _No entries yet._
 
+## [v02.04.01] - 2026-05-02
+
+**CI hotfix for the v2.4.0 stub fail-fast gate.** The v2.4.0 P1.1 fix throws when `CROSS_REVIEW_V2_STUB=1` is set without confirmation. CI workflow `ci.yml` already passed `CROSS_REVIEW_V2_STUB=1` to the smoke step, but `mcp/server.ts` had a top-level `main().catch(...)` that ran on every module import — including the smoke harness's `import { SessionIdSchema, pruneCompletedJobs } from "../src/mcp/server.js"`. In CI, that import-time `main()` saw STUB=1 without confirmation (because confirmation is only set inside `scripts/smoke.ts`'s body, after ESM imports resolve) and tripped the gate. Locally the test passed only because the host env did not pre-set STUB.
+
+### Fixed
+
+- **`mcp/server.ts` top-level `main()` guard.** `main()` now runs only when the module is invoked as the entry point (canonical ESM `fileURLToPath(import.meta.url) === path.resolve(process.argv[1])` check). Importing named exports (`SessionIdSchema`, `pruneCompletedJobs`, `JobStatus`) no longer triggers a server boot, so the smoke harness can validate the schema without spinning up a real orchestrator.
+- **`.github/workflows/ci.yml` + `publish.yml`.** Belt-and-suspenders: both workflows now also set `CROSS_REVIEW_V2_STUB_CONFIRMED: "1"` alongside `CROSS_REVIEW_V2_STUB: "1"` so the gate is satisfied even if a future change reintroduces import-time side effects.
+
+### Validation
+
+- `CROSS_REVIEW_V2_STUB=1 npm run smoke` (reproducing the CI failure scenario without the confirmation flag) — EXIT=0 GREEN with all four `[smoke]` markers PASS.
+- `CROSS_REVIEW_V2_STUB=1 CROSS_REVIEW_V2_STUB_CONFIRMED=1 npm test` — EXIT=0 GREEN.
+
 ## [v02.04.00] - 2026-05-02
 
 **Audit-closure hardening pass.** Closes 18 priorities + 5 misc items from the internal v2.3.3 technical opinion audit. Mirrors the v1 v1.6.7 cycle. Additive within the v2.x public surface plus three behavioral changes flagged below.

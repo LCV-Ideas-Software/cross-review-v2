@@ -58,6 +58,9 @@ jobs:
         run: npm test
         env:
           CROSS_REVIEW_V2_STUB: "1"
+          # v2.4.0 / P1.1 fail-fast: stub activation requires explicit
+          # confirmation. The smoke harness is a legitimate stub consumer.
+          CROSS_REVIEW_V2_STUB_CONFIRMED: "1"
 
       - name: Resolve release metadata
         id: meta
