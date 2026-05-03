@@ -937,6 +937,24 @@ export async function main(): Promise<void> {
       console.error(`[cross-review-v2] startup in_flight sweep error: ${message}`);
     }
   });
+  // v2.5.0: companion to clearStaleInFlight — abort sessions that the
+  // caller never finalized. Runs AFTER the in_flight sweep (FIFO setImmediate
+  // ordering) so a session whose in_flight got cleared this same boot is
+  // immediately eligible for staleness review.
+  setImmediate(() => {
+    try {
+      const abortSweep = runtime.orchestrator.store.abortStaleSessions();
+      if (abortSweep.scanned > 0) {
+        console.error(
+          "[cross-review-v2] startup stale-session abort sweep:",
+          JSON.stringify(abortSweep),
+        );
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[cross-review-v2] startup stale-session abort sweep error: ${message}`);
+    }
+  });
 }
 
 // v2.4.0 / cross-review-v2 R6 follow-up (CI failure 25199679588): guard

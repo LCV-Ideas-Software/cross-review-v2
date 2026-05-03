@@ -75,6 +75,38 @@ function safePromptText(value: string, maxLength = 4_000): string {
   return `${cleaned.slice(0, maxLength - 3)}...`;
 }
 
+// v2.5.0 (operator directive 2026-05-03): session-start contract injected
+// at the top of every caller/peer prompt. Codifies three project-wide rules
+// surfaced by the 253-session corpus analysis:
+//
+//   1) R1 evidence-upfront: callers MUST front-load concrete evidence (file
+//      paths with line numbers, grep output, diff hunks, MD5 hashes, log
+//      excerpts). Empirical pattern across v0.5.7/v0.5.8/v0.5.9 cross-reviews
+//      was identical: codex returned NEEDS_EVIDENCE on R1 asking for the
+//      same artifacts. R2 then closed READY trivially. This rule removes
+//      that cycle by making evidence a R1 obligation, not an R2 ask.
+//   2) Anti-verbosity (Claude-named): summary stays short, detail belongs
+//      in evidence_sources. Claude-as-peer was the source of every single
+//      summary truncation warning observed (36/36 in the corpus). Naming
+//      the model is intentional — generic "be concise" did not move the
+//      needle.
+//   3) Surface symmetry: peers and callers share the same compactness
+//      contract; the caller's draft is itself reviewed material.
+//
+// This block is shared across buildReviewPrompt, buildRevisionPrompt,
+// buildInitialDraftPrompt, buildModerationSafeReviewPrompt so that every
+// turn of the session sees the rules.
+function sessionContractDirectives(): string[] {
+  return [
+    "## Session-Start Contract (mandatory, applies to ALL parties — caller and every peer)",
+    "1) R1 evidence-upfront: the caller draft MUST embed concrete evidence inline (file paths with line numbers, grep output, diff hunks, MD5 hashes, log excerpts). Do NOT defer evidence to a later round. NEEDS_EVIDENCE on R1 is a defect of the draft, not of the peer.",
+    "2) Anti-verbosity (applies especially to Claude — historically the worst offender for verbosity in this protocol): keep the verdict surface short and dense. A long verdict is a defect, not thoroughness. Detail belongs in `evidence_sources`, never in `summary`.",
+    "3) Compactness symmetry: the caller's draft is reviewed material; it should obey the same compactness budget peers do. Pad the evidence list, not the prose.",
+    "4) Caller finalize obligation: as soon as caller + every peer reach READY (trilateral or quadrilateral READY), the caller MUST invoke `session_finalize` IMMEDIATELY. Leaving an unanimous-READY session in `outcome: null` is a defect; the boot-time stale-session sweep will eventually abort it, but the correct pattern is an explicit, prompt finalize the moment unanimity is observed.",
+    "",
+  ];
+}
+
 function normalizeReviewFocus(value: string | undefined, config: AppConfig): string | undefined {
   if (value == null) return undefined;
   const neutralized = value.replace(/(^|\n)\s*\/focus\b\s*/gi, "$1");
@@ -166,6 +198,7 @@ function buildModerationSafeReviewPrompt(
   return [
     "# Cross Review - Compact Moderation-Safe Review",
     "",
+    ...sessionContractDirectives(),
     ...reviewFocusBlock(meta, config, reviewFocus),
     "The previous provider request may have been rejected by an automated safety or moderation filter.",
     "Review this compact neutral prompt instead. Do not quote any sensitive text verbatim.",
@@ -193,6 +226,7 @@ function buildReviewPrompt(
   return [
     "# Cross Review - Review Round",
     "",
+    ...sessionContractDirectives(),
     ...reviewFocusBlock(meta, config, reviewFocus),
     "## Original Task",
     safePromptText(meta.task, config.prompt.max_task_chars),
@@ -216,6 +250,7 @@ function buildRevisionPrompt(
   return [
     "# Cross Review - Revision For Convergence",
     "",
+    ...sessionContractDirectives(),
     "Rewrite the solution considering every blocking issue and peer request.",
     "Do not ignore disagreements. Preserve what peers already accepted and fix what prevented unanimity.",
     "",
@@ -237,6 +272,7 @@ function buildInitialDraftPrompt(task: string, config: AppConfig, reviewFocus?: 
   return [
     "# Cross Review - First Draft",
     "",
+    ...sessionContractDirectives(),
     "Create a complete first version for the task below.",
     "The version will be submitted to unanimous peer review.",
     "",
@@ -308,6 +344,23 @@ function containsReviewDecisionLexeme(text: string): boolean {
 
 function uniquePeers(peers: PeerId[]): PeerId[] {
   return [...new Set(peers)];
+}
+
+// v2.5.0 auto-grant repeat-blocker fingerprint. Built from the set of
+// peers that returned NEEDS_EVIDENCE plus their `caller_requests`. If the
+// same peers ask for the same evidence in two consecutive rounds, the
+// auto-grant gate refuses the second grant — extra rounds spent against
+// identical asks are budget waste, not progress.
+function blockerFingerprint(peers: PeerResult[]): string {
+  return peers
+    .filter((peer) => peer.status === "NEEDS_EVIDENCE")
+    .map((peer) => ({
+      peer: peer.peer,
+      asks: [...(peer.structured?.caller_requests ?? [])].sort(),
+    }))
+    .sort((a, b) => a.peer.localeCompare(b.peer))
+    .map((entry) => `${entry.peer}:${entry.asks.join("|")}`)
+    .join(";");
 }
 
 function isSubset(subset: PeerId[], superset: PeerId[]): boolean {
@@ -597,6 +650,28 @@ export class CrossReviewOrchestrator {
               fallback,
               failure.failure_class,
             );
+            // v2.5.0 fix (Codex audit P3, 2026-05-03): every paid retry path
+            // must emit a cost_alert so FinOps consumers can preregister
+            // unexpected spend. Pre-v2.5.0 only `peer.format_recovery`
+            // emitted a cost alert; fallback + moderation-safe retry were
+            // silent. Codex measured the gap empirically (only 2 of 11
+            // observed paid recoveries surfaced an alert).
+            this.emit({
+              type: "peer.fallback.cost_alert",
+              session_id: context.session_id,
+              round: context.round,
+              peer: adapter.id,
+              message: `Fallback model ${fallback.model} for ${adapter.id} will make one additional provider call.`,
+              data: {
+                from_model: adapter.model,
+                to_model: fallback.model,
+                estimated_extra_cost_usd: estimatedPeerRoundCost(
+                  this.config,
+                  [fallback.id],
+                  prompt,
+                ),
+              },
+            });
             try {
               const fallbackResult = await fallback.call(prompt, context);
               const parserWarnings = [
@@ -656,6 +731,23 @@ export class CrossReviewOrchestrator {
         message:
           "Provider rejected the prompt; retrying once with a compact sanitized review prompt.",
         data: { failure_class: failure.failure_class },
+      });
+      // v2.5.0 fix (Codex audit P3, 2026-05-03): mirror the format_recovery
+      // pattern — emit a cost alert before the paid sanitized retry so
+      // FinOps consumers see every chargeable round-trip.
+      this.emit({
+        type: "peer.moderation_recovery.cost_alert",
+        session_id: context.session_id,
+        round: context.round,
+        peer: adapter.id,
+        message: "Moderation-safe retry will make one additional provider call.",
+        data: {
+          estimated_extra_cost_usd: estimatedPeerRoundCost(
+            this.config,
+            [adapter.id],
+            moderationSafePrompt,
+          ),
+        },
       });
 
       try {
@@ -978,6 +1070,11 @@ export class CrossReviewOrchestrator {
                   this.config,
                   input.review_focus,
                 );
+            const recoveryEstimate = estimatedPeerRoundCost(
+              this.config,
+              [adapter.id],
+              recoveryPrompt,
+            );
             this.emit({
               type: "peer.format_recovery.cost_alert",
               session_id: session.session_id,
@@ -986,14 +1083,65 @@ export class CrossReviewOrchestrator {
               message: decisionRetry
                 ? "Full decision retry will make one additional provider call."
                 : "Format recovery will make one additional provider call.",
-              data: {
-                estimated_extra_cost_usd: estimatedPeerRoundCost(
-                  this.config,
-                  [adapter.id],
-                  recoveryPrompt,
-                ),
-              },
+              data: { estimated_extra_cost_usd: recoveryEstimate },
             });
+            // v2.5.0 (Gemini audit revisado, 2026-05-03): hard budget gate
+            // BEFORE the paid recovery call. Pre-v2.5.0 the cost_alert was
+            // notification-only — recovery proceeded even when the
+            // estimated extra cost would push the session over
+            // `max_session_cost_usd`. Now we refuse the recovery and
+            // surface a structured failure so the caller sees the budget
+            // gate kicked, not an opaque "unparseable_after_recovery".
+            //
+            // currentSessionCostNow must reflect cost INCURRED so far,
+            // including this in-progress round. session.totals is stale
+            // because appendRound runs at the END of askPeers — so we
+            // sum: prior rounds (session.totals at askPeers entry) +
+            // already-processed peers in this round (`peers` array) +
+            // the current peer's first-call cost (peerResult).
+            const sessionCostLimit = budgetLimit(this.config);
+            const priorRoundsCost = session.totals.cost.total_cost ?? 0;
+            const currentRoundPriorPeersCost = peers.reduce(
+              (sum, p) => sum + (p.cost?.total_cost ?? 0),
+              0,
+            );
+            const currentPeerFirstCallCost = peerResult.cost?.total_cost ?? 0;
+            const currentSessionCostNow =
+              priorRoundsCost + currentRoundPriorPeersCost + currentPeerFirstCallCost;
+            if (
+              recoveryEstimate != null &&
+              sessionCostLimit != null &&
+              currentSessionCostNow + recoveryEstimate > sessionCostLimit
+            ) {
+              const message = `Recovery refused: ${decisionRetry ? "decision retry" : "format recovery"} would push session cost from $${currentSessionCostNow.toFixed(6)} to $${(currentSessionCostNow + recoveryEstimate).toFixed(6)}, exceeding configured limit $${sessionCostLimit.toFixed(6)}.`;
+              const failure: PeerFailure = {
+                peer: peerResult.peer,
+                provider: peerResult.provider,
+                model: peerResult.model,
+                failure_class: "budget_preflight",
+                message,
+                retryable: false,
+                attempts: peerResult.attempts,
+                latency_ms: peerResult.latency_ms,
+              };
+              rejected.push(failure);
+              this.store.savePeerFailure(session.session_id, roundNumber, failure);
+              this.emit({
+                type: "peer.format_recovery.budget_blocked",
+                session_id: session.session_id,
+                round: roundNumber,
+                peer: peerResult.peer,
+                message,
+                data: {
+                  estimated_extra_cost_usd: recoveryEstimate,
+                  current_session_cost_usd: currentSessionCostNow,
+                  session_limit_usd: sessionCostLimit,
+                },
+              });
+              peers.push(peerResult);
+              this.store.savePeerResult(session.session_id, roundNumber, peerResult);
+              continue;
+            }
             const recovered = await adapter.call(recoveryPrompt, {
               session_id: session.session_id,
               round: roundNumber,
@@ -1107,11 +1255,26 @@ export class CrossReviewOrchestrator {
 
   async runUntilUnanimous(input: RunUntilUnanimousInput): Promise<RunUntilUnanimousOutput> {
     const leadPeer = input.lead_peer ?? "codex";
-    const maxRounds = input.until_stopped
+    const baseMaxRounds = input.until_stopped
       ? Number.MAX_SAFE_INTEGER
       : input.max_rounds && input.max_rounds > 0
         ? input.max_rounds
-        : 8;
+        : this.config.budget.default_max_rounds;
+    // v2.5.0: effective ceiling can be raised by auto-grant logic below.
+    let effectiveMaxRounds = baseMaxRounds;
+    // v2.5.0 auto-grant: when a session reaches its ceiling with caller
+    // READY + only NEEDS_EVIDENCE peer blockers (no NOT_READY, no rejected),
+    // grant one extra round so the caller can address the evidence asks
+    // before being abandoned with `max_rounds_without_unanimity`. Empirical
+    // analysis of the 253-session corpus surfaced 22 max-rounds aborts and
+    // ~200 NEEDS_EVIDENCE blockers across peers — many at round 2-4 against
+    // the default 8-round ceiling, where one more revision likely closes
+    // unanimity. The grant ceiling is small (2) and gated by
+    // repeat-blocker detection so the caller can't burn rounds spinning
+    // against the same NEEDS_EVIDENCE asks.
+    const AUTO_GRANT_CEILING = 2;
+    let autoGrantsUsed = 0;
+    let lastGrantBlockerFingerprint: string | null = null;
     const costLimit = budgetLimit(this.config, input.max_cost_usd, {
       untilStopped: input.until_stopped,
     });
@@ -1194,7 +1357,7 @@ export class CrossReviewOrchestrator {
       draft = generation.text;
     }
 
-    for (let round = 1; round <= maxRounds; round++) {
+    for (let round = 1; round <= effectiveMaxRounds; round++) {
       if (this.isCancelled(session.session_id, input.signal)) {
         this.store.markCancelled(session.session_id, "session_cancelled");
         return {
@@ -1234,7 +1397,61 @@ export class CrossReviewOrchestrator {
         };
       }
 
-      if (round < maxRounds) {
+      // v2.5.0 auto-grant: only consider when we are at the current
+      // ceiling AND the caller did not opt into until_stopped (in which
+      // case the loop is effectively unbounded already).
+      if (
+        !input.until_stopped &&
+        round === effectiveMaxRounds &&
+        autoGrantsUsed < AUTO_GRANT_CEILING
+      ) {
+        const latestRound = session.rounds[session.rounds.length - 1];
+        if (latestRound && latestRound.peers.length > 0) {
+          const peerStatuses = latestRound.peers.map((peer) => peer.status);
+          const hasNotReady = peerStatuses.includes("NOT_READY");
+          const hasRejected = latestRound.rejected.length > 0;
+          const hasNeedsEvidence = peerStatuses.includes("NEEDS_EVIDENCE");
+          const everyPeerReadyOrNeedsEvidence = peerStatuses.every(
+            (status) => status === "READY" || status === "NEEDS_EVIDENCE",
+          );
+          if (
+            !hasNotReady &&
+            !hasRejected &&
+            hasNeedsEvidence &&
+            everyPeerReadyOrNeedsEvidence
+          ) {
+            const fingerprint = blockerFingerprint(latestRound.peers);
+            if (fingerprint === lastGrantBlockerFingerprint) {
+              this.emit({
+                type: "session.auto_round_skipped",
+                session_id: session.session_id,
+                round,
+                message:
+                  "Auto-round-grant withheld: NEEDS_EVIDENCE blockers identical to the previous granted round; further granting would only burn budget against the same asks.",
+                data: { auto_grants_used: autoGrantsUsed, ceiling: AUTO_GRANT_CEILING },
+              });
+            } else {
+              autoGrantsUsed += 1;
+              effectiveMaxRounds += 1;
+              lastGrantBlockerFingerprint = fingerprint;
+              this.emit({
+                type: "session.auto_round_granted",
+                session_id: session.session_id,
+                round,
+                message: `Auto-granted round ${round + 1}: caller READY + ${peerStatuses.filter((status) => status === "NEEDS_EVIDENCE").length} NEEDS_EVIDENCE peer(s); zero NOT_READY/rejected.`,
+                data: {
+                  auto_grants_used: autoGrantsUsed,
+                  ceiling: AUTO_GRANT_CEILING,
+                  base_max_rounds: baseMaxRounds,
+                  effective_max_rounds: effectiveMaxRounds,
+                },
+              });
+            }
+          }
+        }
+      }
+
+      if (round < effectiveMaxRounds) {
         const generation = await adapters[leadPeer].generate(
           buildRevisionPrompt(session, draft, this.config, input.review_focus),
           {
@@ -1257,7 +1474,7 @@ export class CrossReviewOrchestrator {
       session: this.store.read(session.session_id),
       final_text: draft,
       converged: false,
-      rounds: maxRounds,
+      rounds: effectiveMaxRounds,
     };
   }
 }

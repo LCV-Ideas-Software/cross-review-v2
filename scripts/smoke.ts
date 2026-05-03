@@ -20,9 +20,18 @@ process.env.CROSS_REVIEW_V2_STUB = "1";
 // double-confirmation. The smoke suite is the canonical legitimate
 // consumer of stubs and confirms here.
 process.env.CROSS_REVIEW_V2_STUB_CONFIRMED = "1";
-process.env.CROSS_REVIEW_V2_DATA_DIR =
-  process.env.CROSS_REVIEW_V2_DATA_DIR ||
-  path.join(os.tmpdir(), `cross-review-v2-smoke-${Date.now()}`);
+// v2.5.0: smoke MUST run in isolation. Pre-v2.5.0 we honored an operator-
+// provided CROSS_REVIEW_V2_DATA_DIR (`||` fallback), but if that env points
+// at the live MCP runtime dir (e.g. `C:\Users\leona\.cross-review\data`),
+// every smoke run pollutes the operator's session history AND inherits
+// arbitrary stale sessions from earlier real runs that can break
+// deterministic assertions (e.g. `sweepIdle` returning a non-zero count
+// because the operator dir already had >24h-old orphans). CI matches this
+// because it runs without the env. Always force a unique tmpdir.
+process.env.CROSS_REVIEW_V2_DATA_DIR = path.join(
+  os.tmpdir(),
+  `cross-review-v2-smoke-${Date.now()}-${process.pid}`,
+);
 process.env.CROSS_REVIEW_OPENAI_FALLBACK_MODELS ??= "stub-codex-fallback";
 for (const provider of ["OPENAI", "ANTHROPIC", "GEMINI", "DEEPSEEK"]) {
   process.env[`CROSS_REVIEW_${provider}_INPUT_USD_PER_MILLION`] ??= "1000";
@@ -616,6 +625,11 @@ assert.match(
   /CROSS_REVIEW_OPENAI_INPUT_USD_PER_MILLION/,
 );
 
+// v2.5.0: stub-zero-cost (Codex fix #1) means stubs no longer accrue
+// `cost.total_cost`, so a budget-enforcement test that depends on cost
+// arithmetic now needs the explicit escape hatch to make stubs report
+// real estimated cost. Set the env around this assertion only.
+process.env.CROSS_REVIEW_V2_STUB_FORCE_REAL_COST = "1";
 const budgetExceeded = await orchestrator.runUntilUnanimous({
   task: "Verify configured budget limit stops non-converged sessions.",
   initial_draft: "FORCE_NOT_READY",
@@ -624,6 +638,7 @@ const budgetExceeded = await orchestrator.runUntilUnanimous({
   max_rounds: 3,
   max_cost_usd: 0.000001,
 });
+delete process.env.CROSS_REVIEW_V2_STUB_FORCE_REAL_COST;
 assert.equal(budgetExceeded.converged, false);
 assert.equal(budgetExceeded.session.outcome, "max-rounds");
 assert.equal(budgetExceeded.session.outcome_reason, "budget_exceeded");
@@ -652,6 +667,13 @@ assert.equal(untilStoppedNoBudget.session.outcome, "max-rounds");
 assert.equal(untilStoppedNoBudget.session.outcome_reason, "financial_controls_missing");
 assert.equal(untilStoppedNoBudget.rounds, 0);
 
+// v2.5.0: this until_stopped test depends on cost arithmetic to break
+// the otherwise-unbounded loop (until_stopped_max_cost_usd=0.000001).
+// Stub-zero-cost (Codex fix #1) zeros every stub PeerResult.cost,
+// which would prevent the budget_exceeded path from ever firing and
+// turn this assertion into an infinite loop. Force real estimated
+// cost on the stub for the duration of this assertion.
+process.env.CROSS_REVIEW_V2_STUB_FORCE_REAL_COST = "1";
 const untilStoppedDefaultBudget = await new CrossReviewOrchestrator({
   ...loadConfig(),
   data_dir: path.join(os.tmpdir(), `cross-review-v2-until-stopped-budget-${Date.now()}`),
@@ -668,6 +690,7 @@ const untilStoppedDefaultBudget = await new CrossReviewOrchestrator({
   lead_peer: "codex",
   peers: ["claude"],
 });
+delete process.env.CROSS_REVIEW_V2_STUB_FORCE_REAL_COST;
 assert.equal(untilStoppedDefaultBudget.converged, false);
 assert.equal(untilStoppedDefaultBudget.session.outcome, "max-rounds");
 assert.equal(untilStoppedDefaultBudget.session.outcome_reason, "budget_exceeded");
@@ -945,6 +968,309 @@ assert.equal(Object.hasOwn(metrics.decision_quality, "undefined"), false);
   );
   console.log("[smoke] mark_in_flight_concurrency_guard_test: PASS");
 }
+
+// =====================================================================
+// v2.5.0 smoke markers
+// =====================================================================
+
+// v2.5.0: caps differentiation. summary stays at 800; evidence_sources
+// items accept up to 2500; caller_requests/follow_ups items accept up to
+// 1500. The schema must accept the longer payloads (no truncation
+// warning) and reject above-cap entries.
+{
+  const { statusSchema } = await import("../src/core/status.js");
+  const summaryAt800 = "x".repeat(800);
+  const summaryOver = "x".repeat(801);
+  const evidenceAt2500 = "e".repeat(2500);
+  const evidenceOver = "e".repeat(2501);
+  const requestAt1500 = "r".repeat(1500);
+  const requestOver = "r".repeat(1501);
+  assert.equal(statusSchema.safeParse({ status: "READY", summary: summaryAt800 }).success, true);
+  assert.equal(statusSchema.safeParse({ status: "READY", summary: summaryOver }).success, false);
+  assert.equal(
+    statusSchema.safeParse({ status: "READY", evidence_sources: [evidenceAt2500] }).success,
+    true,
+    "evidence_sources items must accept up to 2500 chars (v2.5.0)",
+  );
+  assert.equal(
+    statusSchema.safeParse({ status: "READY", evidence_sources: [evidenceOver] }).success,
+    false,
+  );
+  assert.equal(
+    statusSchema.safeParse({ status: "READY", caller_requests: [requestAt1500] }).success,
+    true,
+    "caller_requests items must accept up to 1500 chars (v2.5.0)",
+  );
+  assert.equal(
+    statusSchema.safeParse({ status: "READY", caller_requests: [requestOver] }).success,
+    false,
+  );
+  assert.equal(
+    statusSchema.safeParse({ status: "READY", follow_ups: [requestAt1500] }).success,
+    true,
+  );
+  console.log("[smoke] summary_cap_differentiation_test: PASS");
+}
+
+// v2.5.0: session-start contract directives. statusInstruction() must
+// surface the per-field budget guidance + the Claude-named anti-verbosity
+// rule. The instruction is read by every peer adapter at every round, so
+// the markers anchored here are operator-visible regression boundaries.
+{
+  const { statusInstruction } = await import("../src/core/status.js");
+  const instruction = statusInstruction();
+  assert.ok(
+    /summary` SHORT \(max 800 chars\)/.test(instruction),
+    "statusInstruction must mention SHORT summary cap of 800 chars (v2.5.0)",
+  );
+  assert.ok(
+    /Claude especially/i.test(instruction),
+    "statusInstruction must name Claude in the anti-verbosity rule (v2.5.0)",
+  );
+  assert.ok(
+    /evidence_sources/.test(instruction),
+    "statusInstruction must direct detail to evidence_sources (v2.5.0)",
+  );
+  console.log("[smoke] session_contract_directives_test: PASS");
+}
+
+// v2.5.0: CROSS_REVIEW_V2_DEFAULT_MAX_ROUNDS env override is honored.
+{
+  const { loadConfig: reload } = await import("../src/core/config.js");
+  const prev = process.env.CROSS_REVIEW_V2_DEFAULT_MAX_ROUNDS;
+  process.env.CROSS_REVIEW_V2_DEFAULT_MAX_ROUNDS = "5";
+  assert.equal(reload().budget.default_max_rounds, 5);
+  process.env.CROSS_REVIEW_V2_DEFAULT_MAX_ROUNDS = "garbage";
+  assert.equal(
+    reload().budget.default_max_rounds,
+    8,
+    "default_max_rounds must fall back to 8 when env value is unparseable",
+  );
+  if (prev == null) delete process.env.CROSS_REVIEW_V2_DEFAULT_MAX_ROUNDS;
+  else process.env.CROSS_REVIEW_V2_DEFAULT_MAX_ROUNDS = prev;
+  console.log("[smoke] default_max_rounds_env_honored_test: PASS");
+}
+
+// v2.5.0: abortStaleSessions marks sessions older than the threshold as
+// `outcome=aborted`. We seed a session, mutate its `updated_at` to 25h
+// ago by hand, then sweep with the default (24h).
+{
+  const { SessionStore } = await import("../src/core/session-store.js");
+  const staleStore = new SessionStore(config);
+  const staleMeta = staleStore.init("stale-session-abort-test", "operator", []);
+  const staleId = staleMeta.session_id;
+  const staleMetaPath = staleStore.metaPath(staleId);
+  const staleRaw = JSON.parse(fs.readFileSync(staleMetaPath, "utf8")) as Record<string, unknown>;
+  staleRaw.updated_at = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+  fs.writeFileSync(staleMetaPath, JSON.stringify(staleRaw, null, 2), "utf8");
+  const sweep = staleStore.abortStaleSessions();
+  assert.ok(sweep.aborted >= 1, `abortStaleSessions must abort ≥1 stale session, got ${sweep.aborted}`);
+  const after = staleStore.read(staleId);
+  assert.equal(after.outcome, "aborted");
+  assert.ok(
+    /^stale_no_finalize_/.test(after.outcome_reason ?? ""),
+    `outcome_reason must be stale_no_finalize_<hours>h, got ${after.outcome_reason}`,
+  );
+  console.log("[smoke] stale_session_aborted_24h_test: PASS");
+}
+
+// v2.5.0: abortStaleSessions skips a session that still has in_flight set
+// (the in-flight sweep owns those) — even if updated_at is stale.
+{
+  const { SessionStore } = await import("../src/core/session-store.js");
+  const inflightStore = new SessionStore(config);
+  const inflightMeta = inflightStore.init("stale-session-skip-test", "operator", []);
+  const inflightId = inflightMeta.session_id;
+  inflightStore.markInFlight(inflightId, {
+    round: 1,
+    peers: [...PEERS],
+    started_at: new Date().toISOString(),
+    scope: {
+      caller: "operator",
+      caller_status: "READY",
+      expected_peers: [...PEERS],
+      reviewer_peers: [...PEERS],
+    },
+  });
+  const inflightMetaPath = inflightStore.metaPath(inflightId);
+  const inflightRaw = JSON.parse(fs.readFileSync(inflightMetaPath, "utf8")) as Record<string, unknown>;
+  inflightRaw.updated_at = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+  fs.writeFileSync(inflightMetaPath, JSON.stringify(inflightRaw, null, 2), "utf8");
+  const sweep = inflightStore.abortStaleSessions();
+  const after = inflightStore.read(inflightId);
+  assert.equal(
+    after.outcome,
+    undefined,
+    `in-flight session must NOT be aborted by stale sweep (got outcome=${after.outcome}, sweep=${JSON.stringify(sweep)})`,
+  );
+  console.log("[smoke] stale_session_skipped_when_running_test: PASS");
+}
+
+// v2.5.0 (Codex audit fix #1): stub adapter must emit zero-cost results
+// so stub sessions never pollute totals.cost.total_cost.
+{
+  const { StubAdapter: Stub } = await import("../src/peers/stub.js");
+  const stub = new Stub(config, "claude");
+  const stubResult = await stub.call("smoke stub zero-cost test prompt", {
+    session_id: "smoke-stub-zero-cost",
+    round: 1,
+    task: "smoke",
+    emit: () => {},
+    stream_tokens: false,
+  });
+  assert.equal(stubResult.cost?.total_cost, 0, "stub PeerResult.cost.total_cost must be 0");
+  assert.equal(stubResult.cost?.source, "stub", "stub PeerResult.cost.source must be 'stub'");
+  const stubGen = await stub.generate("smoke stub generate prompt", {
+    session_id: "smoke-stub-zero-cost",
+    round: 0,
+    task: "smoke",
+    emit: () => {},
+    stream_tokens: false,
+  });
+  assert.equal(stubGen.cost?.total_cost, 0, "stub GenerationResult.cost.total_cost must be 0");
+  assert.equal(stubGen.cost?.source, "stub");
+  console.log("[smoke] stub_zero_cost_test: PASS");
+}
+
+// v2.5.0 (Codex audit fix #3): convergence reason must surface per-peer
+// failure_class instead of the legacy generic "one or more peers failed
+// or did not respond" string.
+{
+  const { PEERS: ALL_PEERS } = await import("../src/core/types.js");
+  void ALL_PEERS;
+  const peerResults: PeerResult[] = [];
+  const failures = [
+    {
+      peer: "claude" as const,
+      provider: "anthropic",
+      model: "claude-x",
+      failure_class: "network" as const,
+      message: "synthetic",
+      retryable: false,
+      attempts: 1,
+      latency_ms: 0,
+    },
+    {
+      peer: "gemini" as const,
+      provider: "google",
+      model: "gemini-x",
+      failure_class: "rate_limit" as const,
+      message: "synthetic",
+      retryable: true,
+      attempts: 2,
+      latency_ms: 0,
+    },
+  ];
+  const convergence = checkConvergence(["claude", "gemini"], "READY", peerResults, failures);
+  assert.equal(convergence.converged, false);
+  assert.ok(
+    convergence.reason.startsWith("peers failed or did not respond:"),
+    `expected structured reason, got: ${convergence.reason}`,
+  );
+  assert.ok(
+    convergence.reason.includes("claude:network") &&
+      convergence.reason.includes("gemini:rate_limit"),
+    `reason must enumerate per-peer failure_class, got: ${convergence.reason}`,
+  );
+  console.log("[smoke] convergence_structured_failure_reason_test: PASS");
+}
+
+// v2.5.0: auto-grant +1 round when caller READY + every peer is in
+// {READY, NEEDS_EVIDENCE} (no NOT_READY, no rejected). Drives the loop
+// with FORCE_NEEDS_EVIDENCE through stub.generate marker propagation
+// (added in this same release) so both rounds see the marker and emit
+// NEEDS_EVIDENCE.
+{
+  // Earlier tests leak `CROSS_REVIEW_V2_PREFLIGHT_MAX_ROUND_COST_USD=0.000001`
+  // into the env (line ~734), which would hard-block this auto-grant test
+  // at the budget preflight gate before any peer call. Override budget
+  // explicitly so the loop reaches the auto-grant gate as designed.
+  const autoGrantEvents: string[] = [];
+  const baseConfig = loadConfig();
+  const autoGrantConfig = {
+    ...baseConfig,
+    data_dir: path.join(os.tmpdir(), `cross-review-v2-auto-grant-${Date.now()}`),
+    budget: {
+      ...baseConfig.budget,
+      preflight_max_round_cost_usd: 1000,
+      max_session_cost_usd: 1000,
+    },
+  };
+  const autoGrantOrch = new CrossReviewOrchestrator(autoGrantConfig, (event) =>
+    autoGrantEvents.push(event.type),
+  );
+  const autoGrantResult = await autoGrantOrch.runUntilUnanimous({
+    task: "Verify auto-grant fires on caller READY + only NEEDS_EVIDENCE peers.",
+    initial_draft: "FORCE_NEEDS_EVIDENCE",
+    lead_peer: "codex",
+    peers: ["claude"],
+    max_rounds: 1,
+  });
+  // Round 1 hits ceiling, gate grants (effectiveMaxRounds: 1 → 2). Round 2
+  // hits new ceiling with same blocker fingerprint, gate skips. Loop exits
+  // at rounds=2.
+  assert.equal(autoGrantResult.converged, false, "auto-grant test must not converge with FORCE_NEEDS_EVIDENCE");
+  assert.equal(autoGrantResult.rounds, 2, `expected rounds=2 after one auto-grant + one repeat-block, got ${autoGrantResult.rounds}`);
+  assert.ok(
+    autoGrantEvents.includes("session.auto_round_granted"),
+    "auto-grant test must emit session.auto_round_granted at round 1",
+  );
+  assert.ok(
+    autoGrantEvents.includes("session.auto_round_skipped"),
+    "auto-grant test must emit session.auto_round_skipped at round 2 (repeat blocker)",
+  );
+  console.log("[smoke] auto_grant_evidence_only_then_skipped_repeat_test: PASS");
+}
+
+// v2.5.0: auto-grant gate REFUSES to fire when any peer is NOT_READY
+// (the gate is restricted to caller READY + only NEEDS_EVIDENCE peers,
+// no NOT_READY, no rejected). With FORCE_NOT_READY, the gate must not
+// emit auto_round_granted, and rounds must stay at the requested
+// max_rounds=1.
+{
+  const blockedEvents: string[] = [];
+  const baseBlockedConfig = loadConfig();
+  const blockedConfig = {
+    ...baseBlockedConfig,
+    data_dir: path.join(os.tmpdir(), `cross-review-v2-auto-grant-blocked-${Date.now()}`),
+    budget: {
+      ...baseBlockedConfig.budget,
+      preflight_max_round_cost_usd: 1000,
+      max_session_cost_usd: 1000,
+    },
+  };
+  const blockedOrch = new CrossReviewOrchestrator(blockedConfig, (event) =>
+    blockedEvents.push(event.type),
+  );
+  const blockedResult = await blockedOrch.runUntilUnanimous({
+    task: "Verify auto-grant gate refuses to fire when any peer is NOT_READY.",
+    initial_draft: "FORCE_NOT_READY",
+    lead_peer: "codex",
+    peers: ["claude"],
+    max_rounds: 1,
+  });
+  assert.equal(blockedResult.converged, false);
+  assert.equal(blockedResult.rounds, 1, `expected rounds=1 (no auto-grant) when peer NOT_READY, got ${blockedResult.rounds}`);
+  assert.ok(
+    !blockedEvents.includes("session.auto_round_granted"),
+    "auto-grant must NOT fire when any peer is NOT_READY",
+  );
+  console.log("[smoke] auto_grant_blocked_by_not_ready_test: PASS");
+}
+
+// v2.5.0 NOTE: smoke coverage for the format-recovery hard budget gate
+// (orchestrator.ts: `peer.format_recovery.budget_blocked` emit + peer
+// failure_class=budget_preflight) is deferred to v2.5.1, when the gate
+// is replicated to the fallback and moderation-recovery branches and a
+// single shared smoke harness can cover all three. Reaching the gate in
+// stub-driven smoke requires very tight budget tuning because the stub's
+// actual output is small (~80 chars) while estimatedPeerRoundCost
+// assumes max_output_tokens; the gap means there's no clean window
+// where preflight passes but the gate fires deterministically without
+// flake-prone arithmetic. The gate is logic-checked by code review
+// (orchestrator.ts:1095-1140) and TypeScript compilation; behavior
+// is observable in production whenever current_session_cost +
+// recovery_estimate > max_session_cost_usd.
 
 console.log(
   JSON.stringify(

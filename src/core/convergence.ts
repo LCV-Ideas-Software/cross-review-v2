@@ -43,9 +43,20 @@ export function checkConvergence(
     };
   }
   if (rejectedPeers.length || missing.length) {
+    // v2.5.0 fix (Codex audit, 2026-05-03): replace the generic
+    // "one or more peers failed or did not respond" reason — observed 47
+    // times in the 253-session corpus, every occurrence equally
+    // unhelpful — with a structured per-peer summary. The reason field
+    // remains a single string so downstream report consumers don't need
+    // a schema migration; the granularity comes from listing peer +
+    // failure_class (or `missing`) for every contributor.
+    const detail = [
+      ...rejected.map((failure) => `${failure.peer}:${failure.failure_class}`),
+      ...missing.map((peer) => `${peer}:missing`),
+    ].join(", ");
     return {
       converged: false,
-      reason: "one or more peers failed or did not respond",
+      reason: `peers failed or did not respond: ${detail}`,
       ready_peers: ready,
       not_ready_peers: notReady,
       needs_evidence_peers: needsEvidence,

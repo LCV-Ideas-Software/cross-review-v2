@@ -18,8 +18,8 @@ function expandHome(rawPath: string): string {
   return rawPath;
 }
 
-export const VERSION = "2.4.1";
-export const RELEASE_DATE = "2026-05-02";
+export const VERSION = "2.5.0";
+export const RELEASE_DATE = "2026-05-03";
 export const DEFAULT_MAX_OUTPUT_TOKENS = 20_000;
 const COST_RATE_ENV_PREFIX: Record<PeerId, string> = {
   codex: "CROSS_REVIEW_OPENAI",
@@ -152,6 +152,12 @@ export function loadConfig(): AppConfig {
       until_stopped_max_cost_usd: numberEnv("CROSS_REVIEW_V2_UNTIL_STOPPED_MAX_COST_USD"),
       preflight_max_round_cost_usd: numberEnv("CROSS_REVIEW_V2_PREFLIGHT_MAX_ROUND_COST_USD"),
       require_rates_for_budget: true,
+      // v2.5.0: configurable fallback for run_until_unanimous when the
+      // caller does not pass `max_rounds` and `until_stopped` is false.
+      // The MCP zod schema still caps caller-supplied values at 32; this
+      // controls the SERVER-side default (previously hardcoded to 8 in
+      // orchestrator.ts). Values <=0 fall back to 8.
+      default_max_rounds: intEnv("CROSS_REVIEW_V2_DEFAULT_MAX_ROUNDS", 8),
     },
     prompt: {
       max_task_chars: intEnv("CROSS_REVIEW_V2_MAX_TASK_CHARS", 8_000),

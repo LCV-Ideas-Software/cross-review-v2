@@ -48,7 +48,9 @@ export interface CostEstimate {
   output_cost?: number;
   total_cost?: number;
   estimated: boolean;
-  source: "configured-rate" | "unknown-rate";
+  // v2.5.0: "stub" tags zero-cost results emitted by the StubAdapter so
+  // FinOps consumers can distinguish synthetic test runs from real spend.
+  source: "configured-rate" | "unknown-rate" | "stub";
 }
 
 export interface PeerStructuredStatus {
@@ -318,6 +320,7 @@ export interface AppConfig {
     until_stopped_max_cost_usd?: number;
     preflight_max_round_cost_usd?: number;
     require_rates_for_budget: boolean;
+    default_max_rounds: number;
   };
   prompt: {
     max_task_chars: number;

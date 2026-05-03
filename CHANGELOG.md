@@ -9,6 +9,62 @@ standard `v00.00.00`; npm package versions remain SemVer.
 
 _No entries yet._
 
+## [v02.05.00] - 2026-05-03
+
+**Operator-driven evidence-and-budget hardening pass + Codex/Gemini empirical-audit fold-ins.** Empirical analysis of 253 historical sessions (Codex audit 2026-05-03) surfaced concrete, measurable gaps that this release closes. Operator authorized a scope of 4 originals + 3 Codex fixes + 1 Gemini fix + 1 env knob; all shipped together with smoke coverage.
+
+### Added
+
+- **Differentiated per-field caps in `core/status.ts`.** `MAX_FIELD_LENGTH = 800` was tripping mostly on `summary` (verbose verdicts) while `evidence_sources` was rarely used at all. Replaced with `MAX_SUMMARY_LENGTH=800` (kept), `MAX_EVIDENCE_LENGTH=2500`, `MAX_REQUEST_LENGTH=1500`. Schema, parser truncation warnings, and `statusInstruction()` directive all use the per-field cap.
+- **Session-start contract directive helper `sessionContractDirectives()` in `core/orchestrator.ts`.** Four mandatory rules injected into every caller/peer prompt builder (review, moderation-safe, revision, initial-draft): (1) R1 evidence-upfront — caller drafts must embed concrete evidence (file paths with line numbers, grep output, diff hunks, MD5 hashes, log excerpts) inline; (2) anti-verbosity (Claude named explicitly — historical worst offender for summary truncation in the corpus); (3) compactness symmetry — caller drafts obey the same compactness budget peers do; (4) caller finalize obligation — invoke `session_finalize` immediately on unanimous READY. Resolves the 22 in-progress orphan sessions Codex measured in the corpus.
+- **`statusInstruction()` rewrite.** Now surfaces the per-field budget guidance ("summary SHORT 800 chars; detail belongs in evidence_sources up to 2500 chars; caller_requests/follow_ups up to 1500 chars each") and a Claude-named anti-verbosity rule.
+- **`SessionStore.abortStaleSessions()`** companion to `clearStaleInFlight()`. Walks `outcome === undefined` sessions whose `updated_at` is older than the threshold (default 24h via `CROSS_REVIEW_V2_STALE_HOURS`), skips active in-flight or live-lock sessions, marks `outcome=aborted` + `outcome_reason=stale_no_finalize_<hours>h`. Wired into `mcp/server.ts` boot path next to the in-flight sweep.
+- **`CROSS_REVIEW_V2_DEFAULT_MAX_ROUNDS` env var** (default 8). `config.budget.default_max_rounds` replaces the hardcoded 8 in `runUntilUnanimous`. The MCP zod schema still caps caller-supplied values at 32.
+- **Auto-grant +1 round logic in `runUntilUnanimous`.** When a session reaches its ceiling with caller READY + every peer in `{READY, NEEDS_EVIDENCE}` + zero NOT_READY/rejected, the orchestrator grants one extra round so the caller can address the evidence asks. `AUTO_GRANT_CEILING = 2` and a deterministic `blockerFingerprint(peers)` (NEEDS_EVIDENCE peers + sorted `caller_requests`) prevent successive grants on the same asks. Emits `session.auto_round_granted` and `session.auto_round_skipped`. Targets the 22 max-rounds aborts Codex measured in the corpus.
+- **`peer.fallback.cost_alert` and `peer.moderation_recovery.cost_alert` events.** Pre-v2.5.0 only `peer.format_recovery.cost_alert` notified FinOps consumers about paid recoveries; the fallback and moderation-safe paths were silent. Codex measured 11 `format_recovery.started` events with only 2 cost-alert siblings — the fallback/moderation paths skewed the ratio. Both events now mirror the format-recovery shape with `estimated_extra_cost_usd`.
+- **Hard budget gate at format-recovery.** Pre-v2.5.0 `peer.format_recovery.cost_alert` was advisory; the paid recovery proceeded even when `current_session_cost + estimated_extra > max_session_cost_usd`. Now the orchestrator refuses the recovery, marks the peer with `failure_class: budget_preflight`, and emits `peer.format_recovery.budget_blocked` with structured cost data.
+
+### Fixed
+
+- **Stub adapters no longer attribute real currency.** Codex measured `US$ 39,255` of phantom spend by stubs in the 253-session corpus (`source: "stub"` was missing; cost rates were applied to character-count tokens). `peers/stub.ts` now overrides every `PeerResult.cost` and `GenerationResult.cost` with a canonical zero-cost estimate tagged `source: "stub"` (added to the `CostEstimate.source` enum in `core/types.ts`). Token usage is preserved for telemetry. A test-only escape hatch `CROSS_REVIEW_V2_STUB_FORCE_REAL_COST=1` lets smoke validate `budget_exceeded` enforcement.
+- **Convergence reason surfaces per-peer `failure_class`.** The legacy `"one or more peers failed or did not respond"` (47 occurrences in the corpus, every one equally unactionable) is replaced with `"peers failed or did not respond: claude:network, gemini:rate_limit, codex:missing"`. The reason field stays a single string; granularity comes from enumerating peer + failure_class for every contributor.
+- **Stub `generate()` propagates FORCE_* test markers.** Pre-v2.5.0 the stub passed a 1200-char slice of the prompt as the synthetic body. The v2.5.0 contract directive injection lengthened the prompt header beyond the 1200-char window, breaking multi-round smoke tests that rely on FORCE_* marker continuity (e.g. budget-exceeded driving claude with FORCE_NOT_READY across 3 rounds). Fixed by detecting carried markers in the input prompt and prefixing them to the generated body.
+
+### Behavioral changes (operator-visible)
+
+- Auto-grant changes the practical max-rounds ceiling from `default_max_rounds` (default 8) to `default_max_rounds + AUTO_GRANT_CEILING` (default 10) for sessions that would converge with one more revision round. The grant gate is restricted to caller-READY + only-NEEDS_EVIDENCE blockers; repeat-blocker fingerprint prevents pathological spending. Sessions with NOT_READY peers or rejected peers see no behavior change.
+- Format-recovery hard budget gate converts a previously-advisory cost alert into a session-blocking decision when the next paid recovery would arithmetically breach `max_session_cost_usd`. Sessions with adequate budget see no change; sessions running close to the cap may now surface `failure_class: budget_preflight` instead of silently overrunning.
+- Smoke unconditionally overrides `CROSS_REVIEW_V2_DATA_DIR` to a fresh `os.tmpdir()` path even when the operator sets the env var. This was previously honored via a `||` fallback, but operators who set it to point at the live runtime directory (`~/.cross-review/data` etc.) saw smoke pollute their session history AND inherit stale orphan sessions that broke deterministic assertions. Documented in the smoke header.
+
+### Validation
+
+- **`npm run build`** clean (TypeScript 6.0.3, exit 0).
+- **`npm run smoke`** EXIT=0 with 13 PASS markers, 9 of them new for v2.5.0:
+  - `summary_cap_differentiation_test`
+  - `session_contract_directives_test`
+  - `default_max_rounds_env_honored_test`
+  - `stale_session_aborted_24h_test`
+  - `stale_session_skipped_when_running_test`
+  - `stub_zero_cost_test`
+  - `convergence_structured_failure_reason_test`
+  - `auto_grant_evidence_only_then_skipped_repeat_test`
+  - `auto_grant_blocked_by_not_ready_test`
+- **`npm run lint`** clean (eslint . --max-warnings=0).
+- **Cross-review-v2 trilateral session `5419e29a-7d99-4c49-99c5-1b28316a9071`** caller=claude, peers=codex+gemini+deepseek, 4 rounds. Outcome: gemini READY (verified, 4×), deepseek READY (verified, 3×), codex NEEDS_EVIDENCE (4×). Codex's residual was a meta-channel limit — the full 60 KB diff exceeded the MCP message budget once protocol overhead was factored in, so codex could not independently verify the diff line-by-line despite each round's increasingly detailed code excerpts (R3 inlined the bug-fix diff for the format-recovery cost gate; R4 inlined orchestrator.ts:1058-1172 verbatim). Operator escalation chose path A: ship with codex's residual documented and a v2.5.1 follow-up to provide a post-commit inspectable artifact (commit hash + per-file split-diff) for codex re-review. This release is therefore majority-verified READY (caller + 2/3 peers) with a known structural blocker rather than a code blocker.
+
+### Deferred to v2.5.1 (small follow-ups)
+
+- **Hard budget gate also for fallback and moderation-recovery paths.** v2.5.0 only gates format-recovery (the most common chargeable retry); replicating the same `current_session_cost + estimated_extra > limit` check at the fallback and moderation-recovery sites is a small, self-contained follow-up that fits a patch release.
+- **Smoke marker for `peer.format_recovery.budget_blocked`.** The format-recovery hard-budget gate is exercised by code path inspection (orchestrator.ts:1095-1140) and TypeScript compilation, not by a dedicated stub-driven smoke marker in v2.5.0. Reason: stub `output_tokens=text.length` (~80 chars) is much smaller than `max_output_tokens` (default 20K), so estimatedPeerRoundCost over-estimates relative to actual cost and there is no clean budget window where preflight passes but the gate fires deterministically without flake-prone arithmetic. v2.5.1 will introduce a shared harness that covers the gate at all three retry sites with the budget tuning resolved.
+
+### Deferred to v2.6+ (architectural)
+
+- **Token-delta event compaction.** 96 282 of 98 664 events in the 253-session corpus are `peer.token.delta`. Operators can opt out via `CROSS_REVIEW_V2_STREAM_TOKENS=0` today; an architectural buffered-emit refactor is deferred.
+- **Evidence Broker** (Codex audit recommendation #1): translate peer NEEDS_EVIDENCE asks into a structured checklist for the next round; deferred as a major design.
+- **Cost reconciliation peer×total.** Historical `meta.json` rows have `mergeCost(peer_costs) !== totals.cost.total_cost` drift; a migration pass is risky without versioned cost-algorithm tagging — deferred.
+- **Provider-health dashboard.** New observability surface; deferred.
+- **Two parallel directive sources.** `statusInstruction()` in `status.ts` and `sessionContractDirectives()` in `orchestrator.ts` both encode Claude-named anti-verbosity and per-field budget rules; not identical and at risk of drifting. Tech-debt note — extract a shared `peerProtocolRules.ts` later.
+
 ## [v02.04.01] - 2026-05-02
 
 **CI hotfix for the v2.4.0 stub fail-fast gate.** The v2.4.0 P1.1 fix throws when `CROSS_REVIEW_V2_STUB=1` is set without confirmation. CI workflow `ci.yml` already passed `CROSS_REVIEW_V2_STUB=1` to the smoke step, but `mcp/server.ts` had a top-level `main().catch(...)` that ran on every module import — including the smoke harness's `import { SessionIdSchema, pruneCompletedJobs } from "../src/mcp/server.js"`. In CI, that import-time `main()` saw STUB=1 without confirmation (because confirmation is only set inside `scripts/smoke.ts`'s body, after ESM imports resolve) and tripped the gate. Locally the test passed only because the host env did not pre-set STUB.

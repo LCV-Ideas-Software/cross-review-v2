@@ -881,4 +881,73 @@ export class SessionStore {
     }
     return { scanned, cleared };
   }
+
+  // v2.5.0: abort sessions that were never finalized.
+  //
+  // Empirical analysis of 253 historical sessions surfaced 22 in-progress
+  // orphans where every peer had reached READY but the caller never
+  // invoked `session_finalize`. Those sessions stayed at `outcome:
+  // undefined` indefinitely, polluting `session_list` and stealing rows
+  // from `session_recover_interrupted` consumers that interpret a missing
+  // outcome as "still running".
+  //
+  // The session-start contract (orchestrator.ts > sessionContractDirectives
+  // rule 4) now codifies the caller's finalize obligation; this boot
+  // sweep cleans up the cases where the caller exited without honoring
+  // that contract. It is a companion to `clearStaleInFlight`, with a
+  // longer threshold because the failure mode is "host died after a
+  // session ran", not "host died mid-round".
+  //
+  // Conditions to abort:
+  //   - meta.outcome is undefined (not finalized);
+  //   - meta.in_flight is absent (i.e. the in-flight sweep already ran or
+  //     the session was never marked in-flight); a still-in-flight session
+  //     is the inFlight sweep's job, not ours;
+  //   - no active lock holder, OR the session is past the staleness
+  //     threshold (default 24h via CROSS_REVIEW_V2_STALE_HOURS).
+  //
+  // Idempotent + best-effort. Returns counts for telemetry.
+  abortStaleSessions(staleHours?: number): { scanned: number; aborted: number } {
+    const envHours = Number.parseFloat(process.env.CROSS_REVIEW_V2_STALE_HOURS ?? "");
+    const hours =
+      staleHours != null && staleHours > 0
+        ? staleHours
+        : Number.isFinite(envHours) && envHours > 0
+          ? envHours
+          : 24;
+    const staleThresholdMs = hours * 60 * 60 * 1000;
+    let scanned = 0;
+    let aborted = 0;
+    for (const session of this.list()) {
+      // Already finalized? Skip.
+      if (session.outcome) continue;
+      // Currently in-flight? Don't race the in-flight sweep — let it
+      // either clear in_flight (next pass aborts) or leave it in place
+      // (legitimate running session, must not be touched).
+      if (session.in_flight) continue;
+      scanned += 1;
+      // Live lock holder => assume still running, skip.
+      const lockPath = path.join(this.sessionDir(session.session_id), ".lock");
+      if (fs.existsSync(lockPath)) {
+        try {
+          const lock = readJson<{ pid?: number }>(lockPath);
+          if (Number.isInteger(lock.pid) && this.processAlive(lock.pid as number)) {
+            continue;
+          }
+        } catch {
+          /* malformed lock — fall through to staleness check */
+        }
+      }
+      const lastTouched = Date.parse(session.updated_at);
+      if (!Number.isFinite(lastTouched)) continue;
+      if (Date.now() - lastTouched < staleThresholdMs) continue;
+      try {
+        this.finalize(session.session_id, "aborted", `stale_no_finalize_${hours}h`);
+        aborted += 1;
+      } catch {
+        /* best-effort */
+      }
+    }
+    return { scanned, aborted };
+  }
 }
