@@ -1,6 +1,7 @@
 import type {
   AppConfig,
   CostEstimate,
+  EvidenceAskJudgment,
   GenerationResult,
   PeerAdapter,
   PeerCallContext,
@@ -250,5 +251,91 @@ export class StubAdapter extends BasePeerAdapter implements PeerAdapter {
       }),
       ...(shouldForceRealStubCost() ? {} : { cost: stubZeroCost() }),
     };
+  }
+
+  // v2.9.0: deterministic judge response driven by FORCE_JUDGE_* markers
+  // in the draft (NOT the prompt; the prompt is built by BasePeerAdapter
+  // and includes the ask too). Markers:
+  //   FORCE_JUDGE_SATISFIED  → satisfied=true, confidence=verified
+  //   FORCE_JUDGE_INFERRED   → satisfied=true, confidence=inferred (NOT promoted by runtime)
+  //   FORCE_JUDGE_UNKNOWN    → satisfied=false, confidence=unknown
+  //   FORCE_JUDGE_PARSE_FAIL → invalid JSON returned (parser_warnings populated)
+  //   default                → satisfied=false, confidence=verified
+  override async judgeEvidenceAsk(
+    ask: string,
+    draft: string,
+    context: PeerCallContext,
+  ): Promise<EvidenceAskJudgment> {
+    void ask;
+    context.emit({
+      type: "peer.judge.started",
+      session_id: context.session_id,
+      round: context.round,
+      peer: this.id,
+      message: "stub judge",
+    });
+    const started = Date.now();
+    let payload: {
+      satisfied: boolean;
+      confidence: "verified" | "inferred" | "unknown";
+      rationale: string;
+    };
+    if (draft.includes("FORCE_JUDGE_PARSE_FAIL")) {
+      // Bypass the JSON parser by emitting plain prose.
+      const generation: GenerationResult = {
+        peer: this.id,
+        provider: this.provider,
+        model: this.model,
+        text: "stub: this response intentionally lacks a JSON object",
+        raw: { stub: true },
+        usage: { input_tokens: ask.length, output_tokens: 60, total_tokens: ask.length + 60 },
+        cost: shouldForceRealStubCost() ? undefined : stubZeroCost(),
+        latency_ms: Date.now() - started,
+        attempts: 1,
+      };
+      return this.parseJudgeResponse(generation, draft.length);
+    }
+    if (draft.includes("FORCE_JUDGE_SATISFIED")) {
+      payload = {
+        satisfied: true,
+        confidence: "verified",
+        rationale: "Stub judge: draft contains FORCE_JUDGE_SATISFIED marker.",
+      };
+    } else if (draft.includes("FORCE_JUDGE_INFERRED")) {
+      payload = {
+        satisfied: true,
+        confidence: "inferred",
+        rationale: "Stub judge: draft hints at satisfaction but evidence is indirect.",
+      };
+    } else if (draft.includes("FORCE_JUDGE_UNKNOWN")) {
+      payload = {
+        satisfied: false,
+        confidence: "unknown",
+        rationale: "Stub judge: cannot determine whether the draft satisfies the ask.",
+      };
+    } else {
+      payload = {
+        satisfied: false,
+        confidence: "verified",
+        rationale: "Stub judge default: no FORCE_JUDGE_* marker; treating as not satisfied.",
+      };
+    }
+    const text = JSON.stringify(payload);
+    const generation: GenerationResult = {
+      peer: this.id,
+      provider: this.provider,
+      model: this.model,
+      text,
+      raw: { stub: true, payload },
+      usage: {
+        input_tokens: ask.length,
+        output_tokens: text.length,
+        total_tokens: ask.length + text.length,
+      },
+      cost: shouldForceRealStubCost() ? undefined : stubZeroCost(),
+      latency_ms: Date.now() - started,
+      attempts: 1,
+    };
+    return this.parseJudgeResponse(generation, draft.length);
   }
 }

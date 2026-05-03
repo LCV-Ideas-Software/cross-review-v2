@@ -207,6 +207,18 @@ export interface EvidenceChecklistItem {
   // v2.8.0: round in which the runtime auto-promoted the item to
   // "addressed". Cleared when the item reverts to "open".
   addressed_at_round?: number;
+  // v2.9.0: how the runtime promoted the item. "resurfacing" is the
+  // v2.8.0 inference (peer did not bring the ask back); "judge" is the
+  // v2.9.0 LLM judgment (judge peer ruled the new draft satisfies the
+  // ask). Operator-set terminal statuses do not populate this field.
+  // Cleared together with addressed_at_round on revert to "open".
+  address_method?: "resurfacing" | "judge";
+  // v2.9.0: brief verbatim rationale string returned by the judge peer
+  // when address_method === "judge". Capped to keep the checklist
+  // payload bounded; full rationale lives in the round's prompt/draft
+  // artifacts and the evidence_status_history note. Undefined for
+  // resurfacing-promoted items.
+  judge_rationale?: string;
 }
 
 // v2.8.0: durable audit trail for every status transition on an
@@ -269,7 +281,50 @@ export interface PeerAdapter {
   model: string;
   call(prompt: string, context: PeerCallContext): Promise<PeerResult>;
   generate(prompt: string, context: PeerCallContext): Promise<GenerationResult>;
+  // v2.9.0: judge an open evidence-checklist ask against a draft. The
+  // judge sees only `ask + draft` (no session history) — by design.
+  // Returns a structured judgment with confidence so the orchestrator
+  // can promote items to "addressed" only when the judge is verified.
+  // Default implementation lives on BasePeerAdapter and routes through
+  // `generate()`; provider adapters do NOT need to override unless they
+  // want a specialized structured-output path.
+  judgeEvidenceAsk(
+    ask: string,
+    draft: string,
+    context: PeerCallContext,
+  ): Promise<EvidenceAskJudgment>;
   probe(): Promise<PeerProbeResult>;
+}
+
+// v2.9.0: structured outcome of one judge call. `satisfied === true`
+// AND `confidence === "verified"` is the only combination the runtime
+// uses to promote `open → addressed` (method = "judge"). Other
+// confidences (`inferred`, `unknown`) leave status unchanged so the
+// peer reviewers retain the final word.
+export interface EvidenceAskJudgment {
+  peer: PeerId;
+  provider: string;
+  model: string;
+  satisfied: boolean;
+  confidence: Confidence;
+  // Brief verbatim rationale (typically 1-3 sentences). Surfaced into
+  // the checklist item's `judge_rationale` and the history entry note
+  // when the judgment promotes the item.
+  rationale: string;
+  // Raw provider response — for postmortem analysis only; the runtime
+  // does not parse this beyond pulling `satisfied/confidence/rationale`.
+  raw: unknown;
+  // Token usage + cost (if rates are configured). Plumbed through the
+  // same `mergeUsage`/`mergeCost` paths as `PeerResult` for FinOps
+  // accounting.
+  usage?: TokenUsage;
+  cost?: CostEstimate;
+  latency_ms: number;
+  attempts: number;
+  // Parser warnings encountered while extracting structured fields from
+  // the provider response. Non-empty does not invalidate the judgment;
+  // it surfaces format-stability concerns to the dashboard.
+  parser_warnings: string[];
 }
 
 export interface PeerCallContext {

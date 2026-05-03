@@ -209,6 +209,7 @@ const TOOL_NAMES = [
   "session_check_convergence",
   "session_attach_evidence",
   "session_evidence_checklist_update",
+  "session_evidence_judge_pass",
   "escalate_to_operator",
   "session_sweep",
   "session_finalize",
@@ -858,6 +859,53 @@ export async function main(): Promise<void> {
         runtime.orchestrator.store.setEvidenceChecklistItemStatus(session_id, item_id, status, {
           note,
           by: "operator",
+        }),
+        response_format,
+      ),
+  );
+
+  server.registerTool(
+    "session_evidence_judge_pass",
+    {
+      title: "Run Evidence Judge Pass",
+      description:
+        "v2.9.0 LLM-based satisfied detection for the Evidence Broker. The configured judge peer reads each currently-open checklist item against the supplied draft and returns a structured judgment (satisfied + confidence + rationale). The runtime promotes only items where satisfied=true AND confidence='verified'; everything else stays open. Terminal operator statuses (satisfied/deferred/rejected) and items already addressed by resurfacing-inference are NEVER touched. Items per pass are capped via CROSS_REVIEW_V2_EVIDENCE_JUDGE_MAX_ITEMS_PER_PASS (default 8). Optional item_ids filter narrows the pass to specific items; omit for all-open. The judge_peer is the LLM that performs the judgment — choose any peer with a configured API key.",
+      inputSchema: z
+        .object({
+          session_id: SessionIdSchema,
+          judge_peer: z.enum(["codex", "claude", "gemini", "deepseek"]),
+          draft: z.string().min(1).max(200_000),
+          item_ids: z
+            .array(
+              z
+                .string()
+                .min(1)
+                .max(64)
+                .regex(/^[a-f0-9]+$/i, "item_id must be a hex string"),
+            )
+            .max(64)
+            .optional(),
+          round: z.number().int().min(1).max(10_000).optional(),
+          review_focus: z.string().min(1).max(4000).optional(),
+          response_format: ResponseFormatSchema,
+        })
+        .strict(),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ session_id, judge_peer, draft, item_ids, round, review_focus, response_format }) =>
+      textResult(
+        await runtime.orchestrator.runEvidenceChecklistJudgePass({
+          session_id,
+          judge_peer,
+          draft,
+          item_ids,
+          round,
+          review_focus,
         }),
         response_format,
       ),

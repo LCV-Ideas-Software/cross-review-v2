@@ -1878,6 +1878,351 @@ assert.equal(Object.hasOwn(metrics.decision_quality, "undefined"), false);
   console.log("[smoke] per_peer_health_metrics_test: PASS");
 }
 
+// v2.9.0 Judge — Verified-Satisfied Promotion (happy path).
+// R1 produces an open evidence-checklist item via FORCE_NEEDS_EVIDENCE.
+// Operator-triggered judge pass with a draft containing FORCE_JUDGE_SATISFIED
+// (stub maps to satisfied=true, confidence=verified) MUST promote
+// item to addressed with address_method="judge", populate
+// judge_rationale, append a runtime history entry, and emit
+// session.evidence_checklist_addressed with method="judge".
+{
+  const judgeEvents: string[] = [];
+  const judgeData: Array<Record<string, unknown> | undefined> = [];
+  const judgeConfig = {
+    ...loadConfig(),
+    data_dir: path.join(os.tmpdir(), `cross-review-v2-judge-verified-${Date.now()}`),
+    budget: {
+      ...loadConfig().budget,
+      max_session_cost_usd: 10000,
+      preflight_max_round_cost_usd: 10000,
+      until_stopped_max_cost_usd: 10000,
+    },
+  };
+  const judgeOrch = new CrossReviewOrchestrator(judgeConfig, (event) => {
+    judgeEvents.push(event.type);
+    if (event.type === "session.evidence_checklist_addressed") judgeData.push(event.data);
+  });
+  const seedRound = await judgeOrch.askPeers({
+    task: "Judge verified-satisfied smoke",
+    draft: "FORCE_NEEDS_EVIDENCE",
+    caller: "operator",
+    peers: ["claude"],
+  });
+  const sessionId = seedRound.session.session_id;
+  const seededItem = seedRound.session.evidence_checklist?.[0];
+  assert.ok(seededItem, "seed round must produce 1 checklist item");
+  assert.equal(seededItem.status ?? "open", "open");
+  assert.equal(seededItem.address_method, undefined, "fresh item has no address_method");
+  // Operator-triggered judge pass with a draft that satisfies the ask.
+  const judgeResult = await judgeOrch.runEvidenceChecklistJudgePass({
+    session_id: sessionId,
+    judge_peer: "claude",
+    draft: "Revised draft with FORCE_JUDGE_SATISFIED — stub returns verified satisfied.",
+  });
+  assert.equal(judgeResult.judged_count, 1);
+  assert.equal(judgeResult.promoted.length, 1);
+  assert.equal(judgeResult.skipped.length, 0);
+  assert.equal(judgeResult.promoted[0].item_id, seededItem.id);
+  // Verify durable promotion.
+  const after = judgeOrch.store.read(sessionId);
+  const promoted = after.evidence_checklist?.find((entry) => entry.id === seededItem.id);
+  assert.equal(promoted?.status, "addressed");
+  assert.equal(promoted?.address_method, "judge");
+  assert.ok(
+    (promoted?.judge_rationale ?? "").includes("FORCE_JUDGE_SATISFIED"),
+    "judge rationale must reflect stub marker",
+  );
+  // History trail attribution.
+  const historyEntry = after.evidence_status_history?.find(
+    (entry) => entry.item_id === seededItem.id && entry.to === "addressed",
+  );
+  assert.ok(historyEntry, "history must record runtime promotion");
+  assert.equal(historyEntry?.from, "open");
+  assert.equal(historyEntry?.by, "runtime");
+  assert.ok(
+    (historyEntry?.note ?? "").startsWith("judge[claude]:"),
+    "history note must carry judge attribution",
+  );
+  // Events: judge pass + per-item addressed event.
+  assert.ok(judgeEvents.includes("session.evidence_judge_pass.started"));
+  assert.ok(judgeEvents.includes("peer.judge.completed"));
+  assert.ok(judgeEvents.includes("session.evidence_judge_pass.completed"));
+  const addressedEvent = judgeData.find(
+    (data) => data && (data as { method?: string }).method === "judge",
+  ) as { method?: string; ids?: string[] } | undefined;
+  assert.ok(addressedEvent, "addressed event must carry method=judge");
+  assert.deepEqual(addressedEvent?.ids, [seededItem.id]);
+  console.log("[smoke] evidence_judge_marks_addressed_when_verified_satisfied_test: PASS");
+}
+
+// v2.9.0 Judge — Skip when inferred or unknown.
+// Confidence floor: only verified judgments promote; inferred/unknown
+// leave the item open and the runtime records `skipped` with reason.
+{
+  const skipConfig = {
+    ...loadConfig(),
+    data_dir: path.join(os.tmpdir(), `cross-review-v2-judge-skip-${Date.now()}`),
+    budget: {
+      ...loadConfig().budget,
+      max_session_cost_usd: 10000,
+      preflight_max_round_cost_usd: 10000,
+      until_stopped_max_cost_usd: 10000,
+    },
+  };
+  const skipOrch = new CrossReviewOrchestrator(skipConfig, () => {});
+  const seedRound = await skipOrch.askPeers({
+    task: "Judge skip smoke",
+    draft: "FORCE_NEEDS_EVIDENCE",
+    caller: "operator",
+    peers: ["claude"],
+  });
+  const sessionId = seedRound.session.session_id;
+  const seedItemId = seedRound.session.evidence_checklist?.[0]?.id;
+  assert.ok(seedItemId);
+  // Pass 1: inferred — must skip.
+  const inferredResult = await skipOrch.runEvidenceChecklistJudgePass({
+    session_id: sessionId,
+    judge_peer: "claude",
+    draft: "Revised draft with FORCE_JUDGE_INFERRED.",
+  });
+  assert.equal(inferredResult.promoted.length, 0);
+  assert.equal(inferredResult.skipped.length, 1);
+  assert.equal(inferredResult.skipped[0].reason, "satisfied_but_unverified");
+  assert.equal(inferredResult.skipped[0].confidence, "inferred");
+  const afterInferred = skipOrch.store.read(sessionId);
+  assert.equal(
+    afterInferred.evidence_checklist?.find((entry) => entry.id === seedItemId)?.status ?? "open",
+    "open",
+    "inferred judgment must NOT promote",
+  );
+  // Pass 2: unknown — must skip with reason not_satisfied (stub maps unknown to satisfied=false).
+  const unknownResult = await skipOrch.runEvidenceChecklistJudgePass({
+    session_id: sessionId,
+    judge_peer: "claude",
+    draft: "Revised draft with FORCE_JUDGE_UNKNOWN.",
+  });
+  assert.equal(unknownResult.promoted.length, 0);
+  assert.equal(unknownResult.skipped.length, 1);
+  assert.equal(unknownResult.skipped[0].confidence, "unknown");
+  const afterUnknown = skipOrch.store.read(sessionId);
+  assert.equal(
+    afterUnknown.evidence_checklist?.find((entry) => entry.id === seedItemId)?.status ?? "open",
+    "open",
+    "unknown judgment must NOT promote",
+  );
+  // No address_method set on either pass.
+  assert.equal(
+    afterUnknown.evidence_checklist?.find((entry) => entry.id === seedItemId)?.address_method,
+    undefined,
+    "skipped items must have no address_method",
+  );
+  console.log("[smoke] evidence_judge_skips_when_inferred_or_unknown_test: PASS");
+}
+
+// v2.9.0 Judge — Preserves Terminal Statuses.
+// Direct regression guard for the operator workflow's invariant: the
+// judge pass MUST NOT touch satisfied / deferred / rejected items, and
+// MUST NOT touch already-addressed items either. Only `open` items are
+// candidates. Mirrors the v2.8.0 evidence_checklist_terminal_preservation_test
+// pattern but for the judge code path.
+{
+  const tpConfig = {
+    ...loadConfig(),
+    data_dir: path.join(os.tmpdir(), `cross-review-v2-judge-terminal-${Date.now()}`),
+    budget: {
+      ...loadConfig().budget,
+      max_session_cost_usd: 10000,
+      preflight_max_round_cost_usd: 10000,
+      until_stopped_max_cost_usd: 10000,
+    },
+  };
+  const tpOrch = new CrossReviewOrchestrator(tpConfig, () => {});
+  // Bootstrap so the session dir exists, then hand-craft a 5-item fixture.
+  const seedRound = await tpOrch.askPeers({
+    task: "Judge terminal preservation smoke",
+    draft: "FORCE_NEEDS_EVIDENCE",
+    caller: "operator",
+    peers: ["claude"],
+  });
+  const sessionId = seedRound.session.session_id;
+  const FIXTURE_ROUND = 9;
+  const fixtureItems = [
+    {
+      id: "1000000000000001",
+      peer: "claude" as const,
+      first_round: 1,
+      last_round: FIXTURE_ROUND,
+      round_count: 3,
+      ask: "open candidate",
+      first_seen_at: "2026-05-03T00:00:00Z",
+      last_seen_at: "2026-05-03T00:00:00Z",
+      status: "open" as const,
+    },
+    {
+      id: "1000000000000002",
+      peer: "claude" as const,
+      first_round: 1,
+      last_round: FIXTURE_ROUND,
+      round_count: 3,
+      ask: "satisfied terminal",
+      first_seen_at: "2026-05-03T00:00:00Z",
+      last_seen_at: "2026-05-03T00:00:00Z",
+      status: "satisfied" as const,
+    },
+    {
+      id: "1000000000000003",
+      peer: "claude" as const,
+      first_round: 1,
+      last_round: FIXTURE_ROUND,
+      round_count: 3,
+      ask: "deferred terminal",
+      first_seen_at: "2026-05-03T00:00:00Z",
+      last_seen_at: "2026-05-03T00:00:00Z",
+      status: "deferred" as const,
+    },
+    {
+      id: "1000000000000004",
+      peer: "claude" as const,
+      first_round: 1,
+      last_round: FIXTURE_ROUND,
+      round_count: 3,
+      ask: "rejected terminal",
+      first_seen_at: "2026-05-03T00:00:00Z",
+      last_seen_at: "2026-05-03T00:00:00Z",
+      status: "rejected" as const,
+    },
+    {
+      id: "1000000000000005",
+      peer: "claude" as const,
+      first_round: 1,
+      last_round: FIXTURE_ROUND,
+      round_count: 3,
+      ask: "already addressed",
+      first_seen_at: "2026-05-03T00:00:00Z",
+      last_seen_at: "2026-05-03T00:00:00Z",
+      status: "addressed" as const,
+      addressed_at_round: FIXTURE_ROUND,
+      address_method: "resurfacing" as const,
+    },
+  ];
+  const meta = tpOrch.store.read(sessionId);
+  meta.evidence_checklist = fixtureItems;
+  fs.writeFileSync(
+    path.join(tpConfig.data_dir, "sessions", sessionId, "meta.json"),
+    JSON.stringify(meta, null, 2),
+  );
+  // Run judge pass with FORCE_JUDGE_SATISFIED — stub would say verified
+  // satisfied for ALL items if asked, so any leak through the open-only
+  // filter would be visible immediately.
+  const result = await tpOrch.runEvidenceChecklistJudgePass({
+    session_id: sessionId,
+    judge_peer: "claude",
+    draft: "Replacement draft with FORCE_JUDGE_SATISFIED everywhere.",
+    round: FIXTURE_ROUND,
+  });
+  // Only the open candidate is judged; queue capped at 1.
+  assert.equal(result.judged_count, 1, "only open items are queued");
+  assert.equal(result.promoted.length, 1);
+  assert.equal(result.promoted[0].item_id, "1000000000000001");
+  // Verify all terminal items + the already-addressed item are unchanged.
+  const after = tpOrch.store.read(sessionId);
+  assert.equal(
+    after.evidence_checklist?.find((entry) => entry.id === "1000000000000002")?.status,
+    "satisfied",
+    "satisfied terminal must remain satisfied",
+  );
+  assert.equal(
+    after.evidence_checklist?.find((entry) => entry.id === "1000000000000003")?.status,
+    "deferred",
+    "deferred terminal must remain deferred",
+  );
+  assert.equal(
+    after.evidence_checklist?.find((entry) => entry.id === "1000000000000004")?.status,
+    "rejected",
+    "rejected terminal must remain rejected",
+  );
+  const alreadyAddressed = after.evidence_checklist?.find(
+    (entry) => entry.id === "1000000000000005",
+  );
+  assert.equal(alreadyAddressed?.status, "addressed");
+  assert.equal(alreadyAddressed?.address_method, "resurfacing");
+  // Open candidate IS promoted.
+  const promoted = after.evidence_checklist?.find((entry) => entry.id === "1000000000000001");
+  assert.equal(promoted?.status, "addressed");
+  assert.equal(promoted?.address_method, "judge");
+  console.log("[smoke] evidence_judge_preserves_terminal_statuses_test: PASS");
+}
+
+// v2.9.0 Judge — Rejects Malformed Responses (codex R1 catch).
+// A judge response that fails to produce a complete JSON payload OR is
+// missing rationale MUST classify as `judge_failed` with the parser
+// warning surfaced in `message` — NEVER promote, NEVER fall through to
+// `not_satisfied`. Cross-review session 59d04035 R1 surfaced this gap;
+// this marker locks the fix in.
+{
+  const rmConfig = {
+    ...loadConfig(),
+    data_dir: path.join(os.tmpdir(), `cross-review-v2-judge-malformed-${Date.now()}`),
+    budget: {
+      ...loadConfig().budget,
+      max_session_cost_usd: 10000,
+      preflight_max_round_cost_usd: 10000,
+      until_stopped_max_cost_usd: 10000,
+    },
+  };
+  const rmEvents: string[] = [];
+  const rmOrch = new CrossReviewOrchestrator(rmConfig, (event) => {
+    rmEvents.push(event.type);
+  });
+  const seedRound = await rmOrch.askPeers({
+    task: "Judge malformed-response smoke",
+    draft: "FORCE_NEEDS_EVIDENCE",
+    caller: "operator",
+    peers: ["claude"],
+  });
+  const sessionId = seedRound.session.session_id;
+  const seedItemId = seedRound.session.evidence_checklist?.[0]?.id;
+  assert.ok(seedItemId);
+  // Stub's FORCE_JUDGE_PARSE_FAIL emits prose without a JSON object;
+  // parseJudgeResponse pushes "judge_response_missing_json_object" into
+  // parser_warnings and leaves rationale="". The runtime MUST classify
+  // this as judge_failed, NOT not_satisfied.
+  const result = await rmOrch.runEvidenceChecklistJudgePass({
+    session_id: sessionId,
+    judge_peer: "claude",
+    draft: "Revised draft with FORCE_JUDGE_PARSE_FAIL marker.",
+  });
+  assert.equal(result.promoted.length, 0, "malformed response must not promote");
+  assert.equal(result.skipped.length, 1, "malformed response must produce 1 skip");
+  assert.equal(
+    result.skipped[0].reason,
+    "judge_failed",
+    `expected reason=judge_failed, got ${result.skipped[0].reason}`,
+  );
+  assert.ok(
+    (result.skipped[0].message ?? "").includes("judge_response_missing_json_object"),
+    "skipped.message must include the parser warning",
+  );
+  // Item stays open on disk.
+  const after = rmOrch.store.read(sessionId);
+  assert.equal(
+    after.evidence_checklist?.find((entry) => entry.id === seedItemId)?.status ?? "open",
+    "open",
+    "malformed judge response must leave item open",
+  );
+  assert.equal(
+    after.evidence_checklist?.find((entry) => entry.id === seedItemId)?.address_method,
+    undefined,
+    "no address_method on malformed-skip path",
+  );
+  // peer.judge.failed event fired.
+  assert.ok(
+    rmEvents.includes("peer.judge.failed"),
+    "peer.judge.failed must fire on parser-corrupt judgments",
+  );
+  console.log("[smoke] evidence_judge_rejects_malformed_response_test: PASS");
+}
+
 // v2.6.1 NOTE: smoke coverage for `peer.fallback.budget_blocked` and
 // `peer.moderation_recovery.budget_blocked` is intentionally NOT
 // included. These two gates use the same arithmetic shape as preflight

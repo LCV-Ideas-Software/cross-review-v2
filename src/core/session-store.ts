@@ -715,6 +715,12 @@ export class SessionStore {
         if (status === "open" && item.last_round < currentRound) {
           item.status = "addressed";
           item.addressed_at_round = currentRound;
+          // v2.9.0: tag the inference path so the dashboard and audit
+          // trail can distinguish runtime resurfacing from runtime judge
+          // promotions. Operator-set terminal statuses do not populate
+          // this field; setEvidenceChecklistItemStatus clears it.
+          item.address_method = "resurfacing";
+          delete item.judge_rationale;
           addressed.push(item);
           history.push({
             ts,
@@ -728,6 +734,8 @@ export class SessionStore {
         } else if (status === "addressed" && item.last_round === currentRound) {
           item.status = "open";
           delete item.addressed_at_round;
+          delete item.address_method;
+          delete item.judge_rationale;
           reopened.push(item);
           history.push({
             ts,
@@ -793,8 +801,56 @@ export class SessionStore {
       };
       item.status = status;
       // The signature excludes "addressed" so any operator-driven status
-      // change clears the runtime-managed `addressed_at_round` stamp.
+      // change clears the runtime-managed stamps (v2.8.0 addressed_at_round
+      // + v2.9.0 address_method + judge_rationale).
       delete item.addressed_at_round;
+      delete item.address_method;
+      delete item.judge_rationale;
+      const history = meta.evidence_status_history ?? [];
+      history.push(entry);
+      meta.evidence_status_history = history;
+      meta.evidence_checklist = checklist;
+      meta.updated_at = ts;
+      writeJson(this.metaPath(sessionId), meta);
+      return { item, history_entry: entry };
+    });
+  }
+
+  // v2.9.0: runtime-judge promotion path. Promotes an `open` item to
+  // `addressed` ONLY — never touches terminal operator statuses, never
+  // moves anything other than open. Atomic under the session lock.
+  // Returns null when the item is not currently `open` (already
+  // addressed, terminal, or missing) so the caller can skip emit.
+  markEvidenceItemAddressedByJudge(
+    sessionId: string,
+    itemId: string,
+    params: { round: number; rationale: string; judge_peer: PeerId },
+  ): { item: EvidenceChecklistItem; history_entry: EvidenceStatusHistoryEntry } | null {
+    return this.withSessionLock(sessionId, () => {
+      const meta = this.read(sessionId);
+      const checklist = meta.evidence_checklist ?? [];
+      const item = checklist.find((entry) => entry.id === itemId);
+      if (!item) return null;
+      const status: EvidenceChecklistStatus = item.status ?? "open";
+      // Single allowed transition: open → addressed (judge). Terminal
+      // statuses (satisfied/deferred/rejected) and already-addressed
+      // items are NOT auto-mutated here.
+      if (status !== "open") return null;
+      const ts = now();
+      const rationale = params.rationale.trim().slice(0, 800);
+      item.status = "addressed";
+      item.addressed_at_round = params.round;
+      item.address_method = "judge";
+      item.judge_rationale = rationale;
+      const entry: EvidenceStatusHistoryEntry = {
+        ts,
+        item_id: itemId,
+        from: "open",
+        to: "addressed",
+        by: "runtime",
+        round: params.round,
+        note: `judge[${params.judge_peer}]: ${rationale}`,
+      };
       const history = meta.evidence_status_history ?? [];
       history.push(entry);
       meta.evidence_status_history = history;

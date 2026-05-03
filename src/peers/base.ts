@@ -1,5 +1,7 @@
 import type {
   AppConfig,
+  Confidence,
+  EvidenceAskJudgment,
   GenerationResult,
   PeerCallContext,
   PeerId,
@@ -171,6 +173,11 @@ export abstract class BasePeerAdapter {
   abstract id: PeerId;
   abstract provider: string;
   abstract model: string;
+  // v2.9.0: declare `generate` here so the default judgeEvidenceAsk
+  // implementation below can route through it without each subclass
+  // re-defining the abstract signature. Subclasses must implement
+  // generate() as their existing PeerAdapter contract requires.
+  abstract generate(prompt: string, context: PeerCallContext): Promise<GenerationResult>;
 
   protected constructor(protected readonly config: AppConfig) {}
 
@@ -340,5 +347,109 @@ export abstract class BasePeerAdapter {
       "Original task:",
       context.task,
     ].join("\n\n");
+  }
+
+  // v2.9.0: default judge implementation. Builds a tightly-scoped prompt
+  // that gives the LLM ONLY the ask + draft (no session history per
+  // design) and asks for a structured boolean satisfied + confidence +
+  // rationale. Routes through this.generate() so cost/usage/latency are
+  // accounted by the same FinOps path as generations. Provider adapters
+  // can override if they want to use structured-output APIs (e.g. OpenAI
+  // structured outputs, Gemini json mode) for stricter parsing.
+  async judgeEvidenceAsk(
+    ask: string,
+    draft: string,
+    context: PeerCallContext,
+  ): Promise<EvidenceAskJudgment> {
+    const prompt = this.buildJudgePrompt(ask, draft);
+    const generation = await this.generate(prompt, context);
+    return this.parseJudgeResponse(generation, draft.length);
+  }
+
+  protected buildJudgePrompt(ask: string, draft: string): string {
+    return [
+      "# Evidence Ask Judgment",
+      "",
+      "You are a judge. The caller has revised a draft and wants to know whether the revision SATISFIES one specific evidence ask raised by a peer in a prior round.",
+      "Your job is single-question: does the draft below answer the ask?",
+      "Do NOT review the draft for other issues. Do NOT propose new asks. Do NOT rubber-stamp.",
+      "",
+      "## Ask (verbatim peer caller_request)",
+      ask,
+      "",
+      "## Draft (the proposed revised solution)",
+      draft,
+      "",
+      "## Output format (REQUIRED — JSON object, exactly these keys)",
+      '{ "satisfied": <true|false>, "confidence": "<verified|inferred|unknown>", "rationale": "<one or two sentences>" }',
+      "",
+      "Rules:",
+      '- "satisfied": true ONLY if the draft contains concrete evidence that answers the ask (file:line, grep output, diff, MD5, log line, etc.).',
+      '- "confidence": "verified" ONLY if you traced the evidence in the draft itself; "inferred" if plausible but you could not directly trace it; "unknown" if you cannot tell.',
+      "- The runtime promotes the ask to addressed only when satisfied=true AND confidence=verified. Anything else leaves the ask open.",
+      '- "rationale": brief, verbatim citation if possible (e.g. "Draft includes the literal `git diff --stat` output requested by the ask").',
+    ].join("\n");
+  }
+
+  protected parseJudgeResponse(
+    generation: GenerationResult,
+    draftLength: number,
+  ): EvidenceAskJudgment {
+    void draftLength;
+    const parserWarnings: string[] = [];
+    let satisfied = false;
+    let confidence: Confidence = "unknown";
+    let rationale = "";
+    try {
+      const trimmed = generation.text.trim();
+      // Tolerate fenced ```json blocks and stray prose around the JSON.
+      const jsonStart = trimmed.indexOf("{");
+      const jsonEnd = trimmed.lastIndexOf("}");
+      if (jsonStart < 0 || jsonEnd < jsonStart) {
+        parserWarnings.push("judge_response_missing_json_object");
+      } else {
+        const payload = JSON.parse(trimmed.slice(jsonStart, jsonEnd + 1)) as {
+          satisfied?: unknown;
+          confidence?: unknown;
+          rationale?: unknown;
+        };
+        if (typeof payload.satisfied === "boolean") {
+          satisfied = payload.satisfied;
+        } else {
+          parserWarnings.push("judge_response_satisfied_not_boolean");
+        }
+        if (
+          payload.confidence === "verified" ||
+          payload.confidence === "inferred" ||
+          payload.confidence === "unknown"
+        ) {
+          confidence = payload.confidence;
+        } else {
+          parserWarnings.push("judge_response_confidence_unrecognized");
+        }
+        if (typeof payload.rationale === "string") {
+          rationale = payload.rationale.trim().slice(0, 800);
+        } else {
+          parserWarnings.push("judge_response_rationale_missing");
+        }
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      parserWarnings.push(`judge_response_parse_failed:${message}`);
+    }
+    return {
+      peer: this.id,
+      provider: this.provider,
+      model: this.model,
+      satisfied,
+      confidence,
+      rationale,
+      raw: generation.raw,
+      usage: generation.usage,
+      cost: generation.cost,
+      latency_ms: generation.latency_ms,
+      attempts: generation.attempts,
+      parser_warnings: parserWarnings,
+    };
   }
 }

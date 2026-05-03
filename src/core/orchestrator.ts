@@ -1,9 +1,12 @@
 import type {
   AppConfig,
+  Confidence,
   ConvergenceResult,
   ConvergenceScope,
+  CostEstimate,
   FallbackEvent,
   PeerAdapter,
+  PeerCallContext,
   PeerFailure,
   PeerId,
   PeerProbeResult,
@@ -12,6 +15,7 @@ import type {
   ReviewStatus,
   RuntimeEvent,
   SessionMeta,
+  TokenUsage,
 } from "./types.js";
 import { PEERS } from "./types.js";
 import { checkConvergence } from "./convergence.js";
@@ -584,6 +588,224 @@ export class CrossReviewOrchestrator {
     await resolveBestModels(this.config);
     const adapters = createAdapters(this.config);
     return Promise.all(selectAdapters(adapters).map((adapter) => adapter.probe()));
+  }
+
+  // v2.9.0: LLM-based satisfied detection for the evidence checklist.
+  // The configured judge peer reads `(ask, draft)` for each currently-open
+  // checklist item (capped at JUDGE_MAX_ITEMS_PER_PASS, default 8) and
+  // returns a structured judgment. The runtime promotes only items where
+  // the judge returns satisfied=true AND confidence=verified — the
+  // confidence floor is non-negotiable per design and prevents the judge
+  // from rubber-stamping unclear cases. Failures (network/timeout/parse)
+  // leave the item open; never crashes the pass. Returns one record per
+  // item attempted (judged + skipped + failed).
+  async runEvidenceChecklistJudgePass(params: {
+    session_id: string;
+    judge_peer: PeerId;
+    draft: string;
+    item_ids?: string[];
+    round?: number;
+    review_focus?: string;
+  }): Promise<{
+    promoted: Array<{
+      item_id: string;
+      rationale: string;
+      usage?: TokenUsage;
+      cost?: CostEstimate;
+    }>;
+    skipped: Array<{
+      item_id: string;
+      reason: "not_open" | "satisfied_but_unverified" | "not_satisfied" | "judge_failed";
+      satisfied?: boolean;
+      confidence?: Confidence;
+      message?: string;
+    }>;
+    judged_count: number;
+    capped: boolean;
+  }> {
+    const meta = this.store.read(params.session_id);
+    const checklist = meta.evidence_checklist ?? [];
+    const adapter = this.adapters[params.judge_peer];
+    if (!adapter) {
+      throw new Error(`unknown_judge_peer: ${params.judge_peer}`);
+    }
+    const cap = Math.max(
+      1,
+      Math.min(
+        100,
+        Number.parseInt(process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_MAX_ITEMS_PER_PASS ?? "8", 10) ||
+          8,
+      ),
+    );
+    const filterIds = params.item_ids?.length ? new Set(params.item_ids) : null;
+    const candidates = checklist.filter((item) => {
+      if (filterIds && !filterIds.has(item.id)) return false;
+      return (item.status ?? "open") === "open";
+    });
+    const capped = candidates.length > cap;
+    const queue = candidates.slice(0, cap);
+    // Round used for history attribution. If caller did not specify a
+    // round (e.g. operator-triggered judgment between rounds), derive
+    // from the highest round on the session — that is the round whose
+    // draft the judgment is being run against.
+    const judgmentRound =
+      params.round ?? (meta.rounds.length ? meta.rounds[meta.rounds.length - 1].round : 1);
+    const promoted: Array<{
+      item_id: string;
+      rationale: string;
+      usage?: TokenUsage;
+      cost?: CostEstimate;
+    }> = [];
+    const skipped: Array<{
+      item_id: string;
+      reason: "not_open" | "satisfied_but_unverified" | "not_satisfied" | "judge_failed";
+      satisfied?: boolean;
+      confidence?: Confidence;
+      message?: string;
+    }> = [];
+
+    this.emit({
+      type: "session.evidence_judge_pass.started",
+      session_id: params.session_id,
+      round: judgmentRound,
+      message: `Running judge pass on ${queue.length} open item(s) via ${params.judge_peer} (cap ${cap}).`,
+      data: { judge_peer: params.judge_peer, items_queued: queue.length, capped },
+    });
+
+    for (const item of queue) {
+      const context: PeerCallContext = {
+        session_id: params.session_id,
+        round: judgmentRound,
+        task: meta.task,
+        emit: this.emit,
+      };
+      try {
+        const judgment = await adapter.judgeEvidenceAsk(item.ask, params.draft, context);
+        this.emit({
+          type: "peer.judge.completed",
+          session_id: params.session_id,
+          round: judgmentRound,
+          peer: params.judge_peer,
+          message: `Judge ruling on ${item.id}: satisfied=${judgment.satisfied}, confidence=${judgment.confidence}.`,
+          data: {
+            item_id: item.id,
+            satisfied: judgment.satisfied,
+            confidence: judgment.confidence,
+            parser_warnings: judgment.parser_warnings,
+          },
+        });
+        // v2.9.0 — codex R1 catch (cross-review session 59d04035): the
+        // promotion path MUST gate on parser_warnings AND a non-empty
+        // rationale before mutating state. Pre-fix a malformed judge
+        // response with `satisfied=true, confidence="verified"` but
+        // `rationale=""` would still promote, defeating the audit-trail
+        // guarantee. A truly malformed response (missing JSON object)
+        // also defaults to `satisfied=false, confidence="unknown"` and
+        // would silently fall into `not_satisfied` instead of surfacing
+        // as `judge_failed`. Both paths are now classified explicitly:
+        //   - parser_warnings populated OR rationale empty → judge_failed
+        //   - else if satisfied && verified                → promote
+        //   - else if satisfied                            → satisfied_but_unverified
+        //   - else                                         → not_satisfied
+        const parserCorrupted = judgment.parser_warnings.length > 0;
+        const rationaleEmpty = judgment.rationale.trim().length === 0;
+        if (parserCorrupted || rationaleEmpty) {
+          const failureMessage = parserCorrupted
+            ? judgment.parser_warnings.join("; ")
+            : "judge_response_rationale_empty";
+          skipped.push({
+            item_id: item.id,
+            reason: "judge_failed",
+            satisfied: judgment.satisfied,
+            confidence: judgment.confidence,
+            message: failureMessage,
+          });
+          this.emit({
+            type: "peer.judge.failed",
+            session_id: params.session_id,
+            round: judgmentRound,
+            peer: params.judge_peer,
+            message: `Judge response defective on ${item.id}: ${failureMessage}`,
+            data: {
+              item_id: item.id,
+              message: failureMessage,
+              parser_warnings: judgment.parser_warnings,
+              rationale_empty: rationaleEmpty,
+            },
+          });
+        } else if (judgment.satisfied && judgment.confidence === "verified") {
+          const result = this.store.markEvidenceItemAddressedByJudge(params.session_id, item.id, {
+            round: judgmentRound,
+            rationale: judgment.rationale,
+            judge_peer: params.judge_peer,
+          });
+          if (result) {
+            promoted.push({
+              item_id: item.id,
+              rationale: result.item.judge_rationale ?? judgment.rationale,
+              usage: judgment.usage,
+              cost: judgment.cost,
+            });
+            this.emit({
+              type: "session.evidence_checklist_addressed",
+              session_id: params.session_id,
+              round: judgmentRound,
+              message: `Judge promoted ${item.id} to addressed (${params.judge_peer}).`,
+              data: {
+                ids: [item.id],
+                count: 1,
+                method: "judge",
+                judge_peer: params.judge_peer,
+              },
+            });
+          } else {
+            // Concurrent mutation between filter and lock — item already
+            // moved to a non-open state. Treat as not_open.
+            skipped.push({ item_id: item.id, reason: "not_open" });
+          }
+        } else if (judgment.satisfied) {
+          skipped.push({
+            item_id: item.id,
+            reason: "satisfied_but_unverified",
+            satisfied: judgment.satisfied,
+            confidence: judgment.confidence,
+          });
+        } else {
+          skipped.push({
+            item_id: item.id,
+            reason: "not_satisfied",
+            satisfied: judgment.satisfied,
+            confidence: judgment.confidence,
+          });
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        skipped.push({ item_id: item.id, reason: "judge_failed", message });
+        this.emit({
+          type: "peer.judge.failed",
+          session_id: params.session_id,
+          round: judgmentRound,
+          peer: params.judge_peer,
+          message: `Judge call failed on ${item.id}: ${message}`,
+          data: { item_id: item.id, message },
+        });
+      }
+    }
+
+    this.emit({
+      type: "session.evidence_judge_pass.completed",
+      session_id: params.session_id,
+      round: judgmentRound,
+      message: `Judge pass complete: ${promoted.length} promoted, ${skipped.length} skipped.`,
+      data: {
+        judge_peer: params.judge_peer,
+        promoted_count: promoted.length,
+        skipped_count: skipped.length,
+        capped,
+      },
+    });
+
+    return { promoted, skipped, judged_count: queue.length, capped };
   }
 
   async initSession(
