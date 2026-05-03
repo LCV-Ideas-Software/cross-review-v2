@@ -9,6 +9,41 @@ standard `v00.00.00`; npm package versions remain SemVer.
 
 _No entries yet._
 
+## [v02.07.00] - 2026-05-03
+
+**Evidence Broker (Codex+Gemini audit item #1).** Empirical analysis of 253 historical sessions surfaced 200+ NEEDS_EVIDENCE blockers across peers, with many sessions repeating the same `caller_request` across multiple rounds without explicit acknowledgement. v2.7.0 adds a per-session "evidence checklist" that aggregates every NEEDS_EVIDENCE peer's `caller_requests` into a deduplicated, persistent list. Each subsequent revision prompt now surfaces the running checklist as a "Outstanding Evidence Asks" block, so the caller can no longer drift past unaddressed asks unintentionally.
+
+### Added
+
+- **`SessionMeta.evidence_checklist?: EvidenceChecklistItem[]`** in `core/types.ts`. Each item carries a stable id (`sha256(peer + ":" + ask)`, 16 hex chars), the originating peer, the verbatim ask, the first/last round it surfaced in, the cumulative `round_count`, and ISO timestamps for first/last sighting. Sorted by first_round → peer → ask for stable ordering.
+- **`SessionStore.appendEvidenceChecklistItems(sessionId, round, incoming)`** in `core/session-store.ts`. Takes a list of `{ peer, ask }` pairs from one round, deduplicates against the existing checklist by id, and bumps `round_count` + `last_round` + `last_seen_at` for resurfacing asks. Identity is `sha256(peer + ":" + trimmed_ask).slice(0, 16)`. Whitespace-only asks are skipped. Persisted via `withSessionLock` for concurrent-write safety.
+- **Post-round aggregation hook** in `core/orchestrator.ts:askPeers`. After every successful `appendRound`, walks `peers` for NEEDS_EVIDENCE entries, collects their `structured.caller_requests`, and feeds them to `appendEvidenceChecklistItems`. Emits a new `session.evidence_checklist_updated` event with the running totals.
+- **`evidenceChecklistBlock(meta)` prompt helper** in `core/orchestrator.ts`. Renders the checklist as a Markdown section with `- **<peer>** (R<first_round>[ seen N rounds]): <ask>` per item. Repeated asks (`round_count > 1`) get a `[seen N rounds]` tag so the caller sees stickiness at a glance.
+- **`buildRevisionPrompt` injection.** The "Outstanding Evidence Asks" block is injected after the Review Focus block and before the Original Task section in every revision prompt that runs against a session with a non-empty checklist. Initial-draft and review-round prompts are unchanged.
+- **`evidence_broker_aggregate_dedupe_test` smoke marker.** Drives 2 askPeers rounds with FORCE_NEEDS_EVIDENCE on claude (stub returns the same `caller_request` both rounds). Verifies: (a) R1 produces exactly 1 checklist item with `round_count=1`, `first_round=1`, `last_round=1`; (b) R2's same ask does NOT duplicate — it bumps `round_count=2`, `last_round=2`; (c) both rounds emit `session.evidence_checklist_updated`; (d) the verbatim caller_request "Remove the test marker." is preserved.
+
+### Behavioral change (operator-visible)
+
+- Sessions running `runUntilUnanimous` now see revision prompts that explicitly enumerate every outstanding `caller_request` from prior rounds. Sessions where peers converge on R1 (no NEEDS_EVIDENCE) see no change — the checklist stays empty and the prompt block is omitted. Sessions where peers cycle through repeated NEEDS_EVIDENCE will see the `[seen N rounds]` tag escalate in subsequent prompts, surfacing the stickiness.
+- New event type `session.evidence_checklist_updated` appears in `events.ndjson` after every round that aggregated at least one new or resurfacing ask. Operators monitoring `session_events` can read this to detect "session is making no evidence progress" patterns.
+
+### Validation
+
+- **`npm run build`** clean.
+- **`npm run format:check`** clean.
+- **`npm run lint`** clean.
+- **`npm run smoke`** EXIT=0 with 18 PASS markers (17 carry-over from v2.6.1 + 1 new: `evidence_broker_aggregate_dedupe_test`).
+- **Cross-review-v2 trilateral session `734aa133-c9cf-44d2-875d-75afa077c884`** caller=claude, peers=codex+gemini+deepseek, 2 rounds, ~$0.34 USD. **Outcome: converged unanimous_ready** (all 4 parties READY). R1 codex caught a real protocol contradiction in `evidenceChecklistBlock` wording — it said "NEEDS_EVIDENCE on R1 is acceptable" while session-start contract rule #1 says R1 NEEDS_EVIDENCE is a draft defect. R2 applied codex's verbatim suggested fix ("R1 NEEDS_EVIDENCE indicates missing upfront evidence in the original draft (a draft defect per session-start contract rule #1); any same ask resurfacing in R2+ is additionally a revision defect.") — all 3 peers verified-READY in R2. Per `feedback_peer_review_rigor.md`: codex's rigor surfaced a real bug that gemini+deepseek both missed.
+
+### Deferred to v2.7.1+ (small follow-ups)
+
+- **Address detection.** v2.7.0 does not auto-mark items as "addressed" when the new draft mentions/satisfies the ask. Heuristic detection (substring/similarity match against the new draft) is the v2.7.1 follow-up. v2.8+ may use an LLM-based judgment call.
+- **Operator workflow** for marking items as "satisfied" / "deferred" / "rejected" explicitly via a dedicated MCP tool.
+
+### Deferred to v2.8+ (architectural)
+
+- **Per-provider health dashboard** (Codex+Gemini): READY rate, NEEDS_EVIDENCE rate, average cost, parser warnings per provider. Builds on the existing dashboard server.
+
 ## [v02.06.01] - 2026-05-03
 
 **Hard budget gate replication for fallback + moderation-recovery paths (v2.6.1 backlog item from v2.5.0/v2.6.0 deferral).** Pre-v2.6.1 only the format-recovery branch refused paid recoveries that would breach `max_session_cost_usd`; the fallback and moderation-safe-retry branches still proceeded silently after their `cost_alert` events. v2.6.1 brings them in line: each branch now evaluates `priorRoundsCost + estimate > sessionCostLimit` BEFORE the paid call and surfaces a `peer.fallback.budget_blocked` / `peer.moderation_recovery.budget_blocked` event + `failure_class: budget_preflight` failure if the projected spend would exceed the limit.

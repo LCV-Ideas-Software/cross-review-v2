@@ -601,6 +601,68 @@ export class SessionStore {
     });
   }
 
+  // v2.7.0 Evidence Broker: aggregate NEEDS_EVIDENCE asks from a round
+  // into the session-level checklist. Each (peer, ask) pair is
+  // deduplicated by sha256(peer + ":" + ask) so the same ask repeated
+  // across rounds increments `round_count` instead of producing
+  // duplicate entries. Returns the updated checklist (or empty array
+  // if nothing was added/updated).
+  appendEvidenceChecklistItems(
+    sessionId: string,
+    round: number,
+    incoming: Array<{ peer: PeerId; ask: string }>,
+  ): NonNullable<SessionMeta["evidence_checklist"]> {
+    if (!incoming.length) return [];
+    return this.withSessionLock(sessionId, () => {
+      const meta = this.read(sessionId);
+      const existing = meta.evidence_checklist ?? [];
+      const byId = new Map(existing.map((item) => [item.id, item]));
+      const ts = now();
+      for (const { peer, ask } of incoming) {
+        const trimmed = ask.trim();
+        if (!trimmed) continue;
+        const id = crypto
+          .createHash("sha256")
+          .update(`${peer}:${trimmed}`)
+          .digest("hex")
+          .slice(0, 16);
+        const existing = byId.get(id);
+        if (existing) {
+          // Same ask resurfaced. Bump last_round/last_seen_at and
+          // round_count only when the round number is strictly newer
+          // (avoid double-counting if the same caller_request appears
+          // multiple times within the same round across peers — though
+          // we already iterate per-peer, so this is defensive).
+          if (round > existing.last_round) {
+            existing.last_round = round;
+            existing.last_seen_at = ts;
+            existing.round_count += 1;
+          }
+        } else {
+          byId.set(id, {
+            id,
+            peer,
+            first_round: round,
+            last_round: round,
+            round_count: 1,
+            ask: trimmed,
+            first_seen_at: ts,
+            last_seen_at: ts,
+          });
+        }
+      }
+      const updated = Array.from(byId.values()).sort((a, b) => {
+        if (a.first_round !== b.first_round) return a.first_round - b.first_round;
+        if (a.peer !== b.peer) return a.peer.localeCompare(b.peer);
+        return a.ask.localeCompare(b.ask);
+      });
+      meta.evidence_checklist = updated;
+      meta.updated_at = ts;
+      writeJson(this.metaPath(sessionId), meta);
+      return updated;
+    });
+  }
+
   recoverInterruptedSessions(activeSessionIds = new Set<string>()): SessionMeta[] {
     const recovered: SessionMeta[] = [];
     for (const session of this.list()) {

@@ -241,6 +241,27 @@ function buildReviewPrompt(
   ].join("\n");
 }
 
+// v2.7.0 Evidence Broker: render the per-session evidence checklist
+// as a prompt-friendly block. Items repeated across rounds get a
+// "[seen N rounds]" tag so the caller knows the ask is sticky.
+// Each item shows the originating peer + the verbatim ask.
+function evidenceChecklistBlock(meta: SessionMeta): string[] {
+  const checklist = meta.evidence_checklist ?? [];
+  if (!checklist.length) return [];
+  const lines = [
+    "## Outstanding Evidence Asks (running checklist across all rounds)",
+    "Each line below is a `caller_request` returned by a peer in NEEDS_EVIDENCE state.",
+    "Address every outstanding ask in the revised version below — concrete file:line references, grep output, diff hunks, MD5 hashes, log lines. R1 NEEDS_EVIDENCE indicates missing upfront evidence in the original draft (a draft defect per session-start contract rule #1); any same ask resurfacing in R2+ is additionally a revision defect.",
+    "",
+  ];
+  for (const item of checklist) {
+    const persistence = item.round_count > 1 ? ` [seen ${item.round_count} rounds]` : "";
+    lines.push(`- **${item.peer}** (R${item.first_round}${persistence}): ${item.ask}`);
+  }
+  lines.push("");
+  return lines;
+}
+
 function buildRevisionPrompt(
   meta: SessionMeta,
   draft: string,
@@ -255,6 +276,7 @@ function buildRevisionPrompt(
     "Do not ignore disagreements. Preserve what peers already accepted and fix what prevented unanimity.",
     "",
     ...reviewFocusBlock(meta, config, reviewFocus),
+    ...evidenceChecklistBlock(meta),
     "## Original Task",
     safePromptText(meta.task, config.prompt.max_task_chars),
     "",
@@ -1323,6 +1345,34 @@ export class CrossReviewOrchestrator {
       convergence_scope: convergenceScope,
       started_at: startedAt,
     });
+    // v2.7.0 Evidence Broker: aggregate NEEDS_EVIDENCE asks from this
+    // round into the session-level checklist. Each peer that returned
+    // NEEDS_EVIDENCE with `caller_requests` contributes its asks; the
+    // store deduplicates by sha256(peer + ":" + ask) so a repeated
+    // ask increments round_count instead of duplicating.
+    const evidenceAsks: Array<{ peer: PeerId; ask: string }> = [];
+    for (const peerResult of peers) {
+      if (peerResult.status !== "NEEDS_EVIDENCE") continue;
+      for (const ask of peerResult.structured?.caller_requests ?? []) {
+        if (typeof ask === "string" && ask.trim()) {
+          evidenceAsks.push({ peer: peerResult.peer, ask });
+        }
+      }
+    }
+    if (evidenceAsks.length > 0) {
+      const checklist = this.store.appendEvidenceChecklistItems(
+        session.session_id,
+        round.round,
+        evidenceAsks,
+      );
+      this.emit({
+        type: "session.evidence_checklist_updated",
+        session_id: session.session_id,
+        round: round.round,
+        message: `Evidence checklist now has ${checklist.length} item(s) across ${new Set(checklist.map((c) => c.peer)).size} peer(s).`,
+        data: { items_total: checklist.length },
+      });
+    }
     let updated = this.store.read(session.session_id);
     if (convergence.converged) {
       this.store.saveFinal(session.session_id, input.draft);

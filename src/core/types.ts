@@ -164,6 +164,33 @@ export interface EvidenceAttachment {
   content_type?: string;
 }
 
+// v2.7.0 Evidence Broker: when a peer returns NEEDS_EVIDENCE with
+// `caller_requests`, the runtime aggregates each ask into a structured
+// checklist that gets surfaced into subsequent revision prompts.
+// Empirical driver: the 253-session corpus showed 200+ NEEDS_EVIDENCE
+// blockers across peers, and many sessions repeated the same ask
+// across multiple rounds without explicit acknowledgement.
+export interface EvidenceChecklistItem {
+  // Stable id derived from sha256(`${peer}:${ask}`); identical asks
+  // from the same peer are deduplicated across rounds.
+  id: string;
+  // Peer that surfaced the ask.
+  peer: PeerId;
+  // First round in which this ask was seen (does not advance on repeat).
+  first_round: number;
+  // Most recent round that surfaced this same ask (lets the broker
+  // detect "same blocker, n rounds in a row").
+  last_round: number;
+  // Number of rounds the same ask has surfaced (>=1).
+  round_count: number;
+  // The verbatim caller_request text from the peer's structured status.
+  ask: string;
+  // ISO timestamp of first surfacing.
+  first_seen_at: string;
+  // ISO timestamp of latest surfacing.
+  last_seen_at: string;
+}
+
 export interface GenerationArtifact {
   ts: string;
   round: number;
@@ -265,6 +292,7 @@ export interface SessionMeta {
   convergence_health?: ConvergenceHealth;
   failed_attempts?: Array<PeerFailure & { round: number }>;
   evidence_files?: EvidenceAttachment[];
+  evidence_checklist?: EvidenceChecklistItem[];
   generation_files?: GenerationArtifact[];
   operator_escalations?: OperatorEscalation[];
   control?: SessionControl;
