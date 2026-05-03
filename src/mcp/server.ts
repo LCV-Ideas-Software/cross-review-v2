@@ -473,13 +473,20 @@ export async function main(): Promise<void> {
     {
       title: "Run Until Unanimous",
       description:
-        "Generate or revise a draft and continue real API peer-review rounds until unanimous READY or the configured max_rounds is reached.",
+        "Generate or revise a draft and continue real API peer-review rounds until unanimous READY or the configured max_rounds is reached. v2.11.0: when `caller` is set to a peer id (claude|codex|gemini|deepseek), the relator lottery activates: omit `lead_peer` to have the server randomly select a non-caller peer as relator (modeled on judicial colegiados), or supply an explicit `lead_peer` that is NOT the caller. An explicit `lead_peer === caller` is rejected at the server with `caller_cannot_be_lead_peer` — an agent never reviews itself (workspace HARD GATE).",
       inputSchema: z
         .object({
           task: z.string().min(1).max(SCHEMA_TASK_MAX_CHARS),
           review_focus: ReviewFocusSchema,
           initial_draft: z.string().max(SCHEMA_INITIAL_DRAFT_MAX_CHARS).optional(),
-          lead_peer: PeerSchema.default("codex"),
+          // v2.11.0: lead_peer is now optional. When omitted with a peer
+          // caller, the relator lottery picks one. When omitted with
+          // operator caller, the orchestrator uses "codex" (v2.10 default
+          // preserved).
+          lead_peer: PeerSchema.optional(),
+          // v2.11.0: caller identifies the petitioner for the lottery.
+          // Default "operator" preserves v2.10.0 behavior (no exclusion).
+          caller: z.union([PeerSchema, z.literal("operator")]).default("operator"),
           peers: z
             .array(PeerSchema)
             .min(1)
@@ -507,14 +514,15 @@ export async function main(): Promise<void> {
     {
       title: "Start Until Unanimous",
       description:
-        "Start real API generation/revision rounds in the background until unanimity, max_rounds or budget limit.",
+        "Start real API generation/revision rounds in the background until unanimity, max_rounds or budget limit. v2.11.0: same `caller` + relator-lottery semantics as `run_until_unanimous` — see that tool for details.",
       inputSchema: z
         .object({
           session_id: SessionIdSchema.optional(),
           task: z.string().min(1).max(SCHEMA_TASK_MAX_CHARS),
           review_focus: ReviewFocusSchema,
           initial_draft: z.string().max(SCHEMA_INITIAL_DRAFT_MAX_CHARS).optional(),
-          lead_peer: PeerSchema.default("codex"),
+          lead_peer: PeerSchema.optional(),
+          caller: z.union([PeerSchema, z.literal("operator")]).default("operator"),
           peers: z
             .array(PeerSchema)
             .min(1)
@@ -534,9 +542,15 @@ export async function main(): Promise<void> {
       },
     },
     async ({ response_format, ...input }) => {
+      // v2.11.0: when caller is a peer id and lead_peer is omitted, the
+      // session is initialized with caller as the session caller (so
+      // session_init's caller field reflects the petitioner). Otherwise
+      // fall back to lead_peer (v2.10) or "operator" (no caller passed).
+      const initCaller =
+        input.caller !== "operator" ? input.caller : (input.lead_peer ?? "operator");
       const session = input.session_id
         ? runtime.orchestrator.store.read(input.session_id)
-        : await runtime.orchestrator.initSession(input.task, input.lead_peer, input.review_focus);
+        : await runtime.orchestrator.initSession(input.task, initCaller, input.review_focus);
       const job = startJob(runtime, "run_until_unanimous", session.session_id, (signal) =>
         runtime.orchestrator.runUntilUnanimous({
           ...input,
@@ -869,7 +883,7 @@ export async function main(): Promise<void> {
     {
       title: "Run Evidence Judge Pass",
       description:
-        "v2.9.0 LLM-based satisfied detection for the Evidence Broker. The configured judge peer reads each currently-open checklist item against the supplied draft and returns a structured judgment (satisfied + confidence + rationale). The runtime promotes only items where satisfied=true AND confidence='verified'; everything else stays open. Terminal operator statuses (satisfied/deferred/rejected) and items already addressed by resurfacing-inference are NEVER touched. Items per pass are capped via CROSS_REVIEW_V2_EVIDENCE_JUDGE_MAX_ITEMS_PER_PASS (default 8). Optional item_ids filter narrows the pass to specific items; omit for all-open. The judge_peer is the LLM that performs the judgment — choose any peer with a configured API key.",
+        "v2.9.0 LLM-based satisfied detection for the Evidence Broker. The configured judge peer reads each currently-open checklist item against the supplied draft and returns a structured judgment (satisfied + confidence + rationale). The runtime promotes only items where satisfied=true AND confidence='verified'; everything else stays open. Terminal operator statuses (satisfied/deferred/rejected) and items already addressed by resurfacing-inference are NEVER touched. Items per pass are capped via CROSS_REVIEW_V2_EVIDENCE_JUDGE_MAX_ITEMS_PER_PASS (default 8). Optional item_ids filter narrows the pass to specific items; omit for all-open. The judge_peer is the LLM that performs the judgment — choose any peer with a configured API key. v2.10.0: optional shadow_mode (default false) routes the pass through a non-mutating path that emits session.evidence_judge_pass.shadow_decision events without touching checklist state — operators use it to collect empirical judgment-quality data before relying on active mutation.",
       inputSchema: z
         .object({
           session_id: SessionIdSchema,
@@ -887,6 +901,7 @@ export async function main(): Promise<void> {
             .optional(),
           round: z.number().int().min(1).max(10_000).optional(),
           review_focus: z.string().min(1).max(4000).optional(),
+          shadow_mode: z.boolean().optional(),
           response_format: ResponseFormatSchema,
         })
         .strict(),
@@ -897,7 +912,16 @@ export async function main(): Promise<void> {
         openWorldHint: false,
       },
     },
-    async ({ session_id, judge_peer, draft, item_ids, round, review_focus, response_format }) =>
+    async ({
+      session_id,
+      judge_peer,
+      draft,
+      item_ids,
+      round,
+      review_focus,
+      shadow_mode,
+      response_format,
+    }) =>
       textResult(
         await runtime.orchestrator.runEvidenceChecklistJudgePass({
           session_id,
@@ -906,6 +930,7 @@ export async function main(): Promise<void> {
           item_ids,
           round,
           review_focus,
+          mode: shadow_mode ? "shadow" : "active",
         }),
         response_format,
       ),
@@ -1039,6 +1064,35 @@ export async function main(): Promise<void> {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[cross-review-v2] startup stale-session abort sweep error: ${message}`);
     }
+  });
+  // v2.10.0: surface judge auto-wire misconfiguration at boot. Per
+  // operator request the runtime never throws on a stray env value (a
+  // typo must not break a paying review-host); we log a single notice
+  // so the operator notices the dead-letter case during real runs.
+  setImmediate(() => {
+    const rawMode = (process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_MODE ?? "")
+      .trim()
+      .toLowerCase();
+    if (!rawMode || rawMode === "off") return;
+    if (rawMode !== "shadow") {
+      console.error(
+        `[cross-review-v2] notice: CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_MODE="${rawMode}" is not recognized; valid values are "off" and "shadow". Auto-wire will be skipped.`,
+      );
+      return;
+    }
+    const rawPeer = (process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_PEER ?? "").trim();
+    const validPeer = (["codex", "claude", "gemini", "deepseek"] as const).includes(
+      rawPeer as PeerId,
+    );
+    if (!validPeer) {
+      console.error(
+        `[cross-review-v2] notice: CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_MODE=shadow is set but CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_PEER ("${rawPeer}") is missing or not one of codex|claude|gemini|deepseek. Shadow auto-wire will be skipped per round; configure the peer to enable it.`,
+      );
+      return;
+    }
+    console.error(
+      `[cross-review-v2] notice: judge auto-wire active in SHADOW mode via peer "${rawPeer}". Every askPeers round will fire a non-mutating judge pass; events session.evidence_judge_pass.shadow_decision are emitted per item.`,
+    );
   });
 }
 

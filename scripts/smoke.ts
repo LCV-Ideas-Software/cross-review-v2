@@ -2223,6 +2223,411 @@ assert.equal(Object.hasOwn(metrics.decision_quality, "undefined"), false);
   console.log("[smoke] evidence_judge_rejects_malformed_response_test: PASS");
 }
 
+// v2.10.0 Judge Auto-wire — OFF (default).
+// Without CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_MODE set, askPeers MUST
+// NOT fire any judge events. Verifies the v2.9.0 contract is preserved
+// for callers that did not opt in.
+{
+  const prevMode = process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_MODE;
+  const prevPeer = process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_PEER;
+  delete process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_MODE;
+  delete process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_PEER;
+  try {
+    const offEvents: string[] = [];
+    const offConfig = {
+      ...loadConfig(),
+      data_dir: path.join(os.tmpdir(), `cross-review-v2-judge-autowire-off-${Date.now()}`),
+      budget: {
+        ...loadConfig().budget,
+        max_session_cost_usd: 10000,
+        preflight_max_round_cost_usd: 10000,
+        until_stopped_max_cost_usd: 10000,
+      },
+    };
+    const offOrch = new CrossReviewOrchestrator(offConfig, (event) => offEvents.push(event.type));
+    await offOrch.askPeers({
+      task: "Judge autowire OFF smoke",
+      draft: "FORCE_NEEDS_EVIDENCE",
+      caller: "operator",
+      peers: ["claude"],
+    });
+    assert.ok(
+      !offEvents.some((event) => event.startsWith("session.evidence_judge_pass.")),
+      "no judge_pass events must fire when AUTOWIRE_MODE is unset",
+    );
+    assert.ok(
+      !offEvents.includes("peer.judge.completed"),
+      "no peer.judge.completed events must fire when AUTOWIRE_MODE is unset",
+    );
+    console.log("[smoke] evidence_judge_autowire_off_no_calls_test: PASS");
+  } finally {
+    if (prevMode === undefined) delete process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_MODE;
+    else process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_MODE = prevMode;
+    if (prevPeer === undefined) delete process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_PEER;
+    else process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_PEER = prevPeer;
+  }
+}
+
+// v2.10.0 Judge Auto-wire — SHADOW emits decisions.
+// With AUTOWIRE_MODE=shadow + AUTOWIRE_PEER=claude, R1 produces a
+// NEEDS_EVIDENCE item; R2 with FORCE_JUDGE_SATISFIED draft fires the
+// shadow judge AFTER address detection. The shadow_decision event MUST
+// fire with would_promote=true; checklist state MUST stay open
+// (mutation suppressed).
+{
+  const prevMode = process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_MODE;
+  const prevPeer = process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_PEER;
+  process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_MODE = "shadow";
+  process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_PEER = "claude";
+  try {
+    const events: string[] = [];
+    const eventData: Array<Record<string, unknown> | undefined> = [];
+    const cfg = {
+      ...loadConfig(),
+      data_dir: path.join(os.tmpdir(), `cross-review-v2-judge-autowire-shadow-${Date.now()}`),
+      budget: {
+        ...loadConfig().budget,
+        max_session_cost_usd: 10000,
+        preflight_max_round_cost_usd: 10000,
+        until_stopped_max_cost_usd: 10000,
+      },
+    };
+    const orch = new CrossReviewOrchestrator(cfg, (event) => {
+      events.push(event.type);
+      if (event.type === "session.evidence_judge_pass.shadow_decision") {
+        eventData.push(event.data);
+      }
+    });
+    const r1 = await orch.askPeers({
+      task: "Judge autowire SHADOW smoke",
+      draft: "FORCE_NEEDS_EVIDENCE",
+      caller: "operator",
+      peers: ["claude"],
+    });
+    const seedItemId = r1.session.evidence_checklist?.[0]?.id;
+    assert.ok(seedItemId, "R1 must produce 1 checklist item");
+    // R2 with FORCE_JUDGE_SATISFIED draft. The peer review path will see
+    // FORCE_NEEDS_EVIDENCE absent → claude returns READY → no NEEDS_EVIDENCE.
+    // Address detection promotes the R1 item to addressed (last_round=1 < 2).
+    // Then shadow judge fires on remaining open items; in this case there are
+    // none open after address detection promotes the lone seed item, so the
+    // pass exits with zero shadow_decisions but still emits started+completed.
+    // To force a shadow decision on a real open item, R2 must keep the same
+    // ask alive: send draft with both FORCE_NEEDS_EVIDENCE (peer raises ask
+    // again, blocks resurfacing-promotion) and FORCE_JUDGE_SATISFIED (judge
+    // says verified-satisfied). The shadow path then records would_promote.
+    await orch.askPeers({
+      session_id: r1.session.session_id,
+      task: "Judge autowire SHADOW smoke",
+      draft: "FORCE_NEEDS_EVIDENCE FORCE_JUDGE_SATISFIED",
+      caller: "operator",
+      peers: ["claude"],
+    });
+    // Filter shadow_decision events for the seed item id with would_promote=true.
+    const shadowForSeed = eventData.filter(
+      (data) =>
+        data &&
+        (data as { item_id?: string }).item_id === seedItemId &&
+        (data as { would_promote?: boolean }).would_promote === true,
+    );
+    assert.ok(
+      shadowForSeed.length >= 1,
+      `shadow_decision event must fire for seed item with would_promote=true (got ${shadowForSeed.length})`,
+    );
+    // Item status MUST remain open (mutation suppressed in shadow mode).
+    const after = orch.store.read(r1.session.session_id);
+    const persisted = after.evidence_checklist?.find((entry) => entry.id === seedItemId);
+    assert.equal(
+      persisted?.status ?? "open",
+      "open",
+      "shadow mode must NOT promote the item to addressed",
+    );
+    assert.equal(persisted?.address_method, undefined, "shadow mode must NOT set address_method");
+    assert.equal(persisted?.judge_rationale, undefined, "shadow mode must NOT set judge_rationale");
+    // session.evidence_judge_pass.started + completed both fire.
+    assert.ok(events.includes("session.evidence_judge_pass.started"));
+    assert.ok(events.includes("session.evidence_judge_pass.completed"));
+    console.log("[smoke] evidence_judge_autowire_shadow_emits_decision_test: PASS");
+  } finally {
+    if (prevMode === undefined) delete process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_MODE;
+    else process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_MODE = prevMode;
+    if (prevPeer === undefined) delete process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_PEER;
+    else process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_PEER = prevPeer;
+  }
+}
+
+// v2.10.0 Judge Auto-wire — SHADOW does not promote (regression).
+// Direct invariant: the explicit MCP tool path with mode="shadow" MUST
+// NOT call markEvidenceItemAddressedByJudge even when the judge response
+// is satisfied=true + confidence=verified. Mirrors the v2.8.0/v2.9.0
+// terminal-preservation pattern but for the shadow code path.
+{
+  const cfg = {
+    ...loadConfig(),
+    data_dir: path.join(os.tmpdir(), `cross-review-v2-judge-shadow-no-promote-${Date.now()}`),
+    budget: {
+      ...loadConfig().budget,
+      max_session_cost_usd: 10000,
+      preflight_max_round_cost_usd: 10000,
+      until_stopped_max_cost_usd: 10000,
+    },
+  };
+  const orch = new CrossReviewOrchestrator(cfg, () => {});
+  const seed = await orch.askPeers({
+    task: "Judge SHADOW does-not-promote regression",
+    draft: "FORCE_NEEDS_EVIDENCE",
+    caller: "operator",
+    peers: ["claude"],
+  });
+  const sessionId = seed.session.session_id;
+  const seedItemId = seed.session.evidence_checklist?.[0]?.id;
+  assert.ok(seedItemId);
+  const result = await orch.runEvidenceChecklistJudgePass({
+    session_id: sessionId,
+    judge_peer: "claude",
+    draft: "Revised draft with FORCE_JUDGE_SATISFIED marker.",
+    mode: "shadow",
+  });
+  // Active-mode "promoted" array is empty; shadow_decisions carries the verdict.
+  assert.equal(result.mode, "shadow");
+  assert.equal(result.promoted.length, 0, "shadow mode must NOT populate promoted[]");
+  assert.equal(result.shadow_decisions.length, 1, "shadow mode must populate shadow_decisions[]");
+  assert.equal(result.shadow_decisions[0].item_id, seedItemId);
+  assert.equal(result.shadow_decisions[0].would_promote, true);
+  assert.equal(result.shadow_decisions[0].satisfied, true);
+  assert.equal(result.shadow_decisions[0].confidence, "verified");
+  // No mutation on disk.
+  const after = orch.store.read(sessionId);
+  const persisted = after.evidence_checklist?.find((entry) => entry.id === seedItemId);
+  assert.equal(persisted?.status ?? "open", "open");
+  assert.equal(persisted?.address_method, undefined);
+  assert.equal(persisted?.judge_rationale, undefined);
+  // No history entry was appended for this no-op.
+  const historyForSeed = (after.evidence_status_history ?? []).filter(
+    (entry) => entry.item_id === seedItemId && entry.to === "addressed",
+  );
+  assert.equal(historyForSeed.length, 0, "shadow mode must NOT append addressed history entries");
+  console.log("[smoke] evidence_judge_autowire_shadow_does_not_promote_test: PASS");
+}
+
+// v2.11.0 Relator Lottery — exclui o caller.
+// 100 sorteios com caller=claude → assigned ∈ {codex,gemini,deepseek}; nunca claude.
+{
+  const { assignRelator } = await import("../src/core/relator-lottery.js");
+  for (let i = 0; i < 100; i++) {
+    const a = assignRelator("claude");
+    assert.notEqual(
+      a.assigned,
+      "claude",
+      `iter ${i}: relator assigned=claude (caller exclusion failed)`,
+    );
+    assert.ok(
+      ["codex", "gemini", "deepseek"].includes(a.assigned),
+      `iter ${i}: assigned=${a.assigned} not in pool`,
+    );
+    assert.equal(a.candidate_pool.length, 3);
+    assert.ok(!a.candidate_pool.includes("claude"));
+    assert.equal(a.entropy_source, "crypto.randomInt");
+  }
+  // Mesmo teste para os outros 3 callers, garantindo simetria.
+  for (const caller of ["codex", "gemini", "deepseek"] as const) {
+    for (let i = 0; i < 50; i++) {
+      const a = assignRelator(caller);
+      assert.notEqual(
+        a.assigned,
+        caller,
+        `caller=${caller} iter ${i}: assigned=${caller} (exclusion failed)`,
+      );
+      assert.equal(a.candidate_pool.length, 3);
+      assert.ok(!a.candidate_pool.includes(caller));
+    }
+  }
+  // operator caller → todos os 4 peers elegíveis (sem exclusão).
+  const opAssign = assignRelator("operator");
+  assert.equal(opAssign.candidate_pool.length, 4);
+  console.log("[smoke] relator_lottery_excludes_caller_test: PASS");
+}
+
+// v2.11.0 Relator Lottery — distribuição uniforme.
+// 1500 sorteios com caller=claude → counts de codex/gemini/deepseek dentro de ±15% de 500 cada.
+// Guard contra Math.random slipping in (não-uniforme/previsível).
+{
+  const { assignRelator } = await import("../src/core/relator-lottery.js");
+  const counts: Record<string, number> = { codex: 0, gemini: 0, deepseek: 0 };
+  const N = 1500;
+  for (let i = 0; i < N; i++) {
+    const a = assignRelator("claude");
+    counts[a.assigned] = (counts[a.assigned] ?? 0) + 1;
+  }
+  const expected = N / 3; // 500
+  const tolerance = expected * 0.15; // ±75
+  for (const peer of ["codex", "gemini", "deepseek"]) {
+    const c = counts[peer];
+    assert.ok(
+      Math.abs(c - expected) <= tolerance,
+      `peer=${peer} count=${c} not within ±15% of ${expected} (range ${expected - tolerance}-${expected + tolerance}). Possible RNG bias.`,
+    );
+  }
+  console.log("[smoke] relator_lottery_uniform_distribution_test: PASS");
+}
+
+// v2.11.0 Relator Lottery — rejeita lead_peer === caller.
+// Chamada explícita com caller=claude e lead_peer=claude DEVE lançar
+// CallerCannotBeLeadPeerError. Sem fallback silencioso pra sorteio.
+{
+  const { assertLeadPeerNotCaller, CallerCannotBeLeadPeerError } =
+    await import("../src/core/relator-lottery.js");
+  let threw = false;
+  try {
+    assertLeadPeerNotCaller("claude", "claude");
+  } catch (err) {
+    threw = true;
+    assert.ok(err instanceof CallerCannotBeLeadPeerError, "must throw CallerCannotBeLeadPeerError");
+    assert.ok(
+      (err as Error).message.includes("caller_cannot_be_lead_peer"),
+      `error message must contain "caller_cannot_be_lead_peer", got: ${(err as Error).message}`,
+    );
+  }
+  assert.ok(threw, "lead_peer === caller must throw");
+  // Casos válidos: caller=claude + lead_peer=codex/gemini/deepseek → no-op.
+  for (const lead of ["codex", "gemini", "deepseek"] as const) {
+    assertLeadPeerNotCaller("claude", lead);
+  }
+  // operator caller → qualquer lead_peer permitido.
+  for (const lead of ["codex", "claude", "gemini", "deepseek"] as const) {
+    assertLeadPeerNotCaller("operator", lead);
+  }
+  console.log("[smoke] lead_peer_caller_match_rejected_test: PASS");
+}
+
+// v2.11.0 Relator Lottery — evento session.relator_assigned emitido.
+// Chamada de runUntilUnanimous com caller=claude e lead_peer omitido →
+// orchestrator emite session.relator_assigned com candidate_pool, assigned,
+// entropy_source preenchidos. Usa stub adapters pra não chamar provider real.
+{
+  const events: Array<{ type: string; data?: Record<string, unknown> }> = [];
+  const cfg = {
+    ...loadConfig(),
+    data_dir: path.join(os.tmpdir(), `cross-review-v2-relator-event-${Date.now()}`),
+    budget: {
+      ...loadConfig().budget,
+      max_session_cost_usd: 10000,
+      preflight_max_round_cost_usd: 10000,
+      until_stopped_max_cost_usd: 10000,
+    },
+  };
+  const orch = new CrossReviewOrchestrator(cfg, (e) => events.push({ type: e.type, data: e.data }));
+  await orch.runUntilUnanimous({
+    task: "Relator lottery event smoke",
+    initial_draft: "Test draft.",
+    caller: "claude",
+    // lead_peer OMITIDO → sorteio
+    peers: ["codex", "gemini", "deepseek"],
+    max_rounds: 1,
+  });
+  const relatorEvents = events.filter((e) => e.type === "session.relator_assigned");
+  assert.equal(
+    relatorEvents.length,
+    1,
+    `expected 1 session.relator_assigned event, got ${relatorEvents.length}`,
+  );
+  const data = relatorEvents[0].data ?? {};
+  assert.equal(data.caller, "claude");
+  assert.ok(Array.isArray(data.candidate_pool));
+  assert.equal((data.candidate_pool as string[]).length, 3);
+  assert.ok(!(data.candidate_pool as string[]).includes("claude"));
+  assert.ok(["codex", "gemini", "deepseek"].includes(data.assigned as string));
+  assert.equal(data.entropy_source, "crypto.randomInt");
+  assert.equal(data.kind, "lottery");
+  console.log("[smoke] relator_assigned_event_emitted_test: PASS");
+}
+
+// v2.11.0 R-fix — session-peers-aware lottery (deepseek R1 catch).
+// Lottery DEVE filtrar candidate pool a partir do array de peers da sessão
+// (não PEERS global). Sem isso, caller=claude com peers=["codex","gemini"]
+// poderia atribuir deepseek (não-participante) como lead_peer.
+{
+  const { assignRelator, resolveLeadPeer, LeadPeerNotInSessionError } =
+    await import("../src/core/relator-lottery.js");
+  // (1) Subset com 2 peers + caller=claude → assigned ∈ subset.
+  for (let i = 0; i < 50; i++) {
+    const a = assignRelator("claude", ["codex", "gemini"]);
+    assert.ok(
+      ["codex", "gemini"].includes(a.assigned),
+      `subset assigned=${a.assigned} fora do subset`,
+    );
+    assert.notEqual(a.assigned, "claude");
+    assert.notEqual(a.assigned, "deepseek");
+    assert.equal(a.candidate_pool.length, 2);
+  }
+  // (2) Subset com 1 peer não-caller → assigned é exatamente esse peer.
+  for (let i = 0; i < 10; i++) {
+    const a = assignRelator("claude", ["codex"]);
+    assert.equal(a.assigned, "codex");
+    assert.equal(a.candidate_pool.length, 1);
+  }
+  // (3) Subset apenas com o próprio caller → erro no_eligible_relator.
+  let threwEmpty = false;
+  try {
+    assignRelator("claude", ["claude"]);
+  } catch (err) {
+    threwEmpty = true;
+    assert.ok((err as Error).message.includes("no_eligible_relator"));
+  }
+  assert.ok(threwEmpty, "subset com apenas caller deve lançar no_eligible_relator");
+  // (4) Explicit lead_peer ∉ session peers → LeadPeerNotInSessionError.
+  let threwNotInSession = false;
+  try {
+    resolveLeadPeer("claude", "deepseek", ["codex", "gemini"]);
+  } catch (err) {
+    threwNotInSession = true;
+    assert.ok(err instanceof LeadPeerNotInSessionError);
+    assert.ok((err as Error).message.includes("lead_peer_not_in_session_peers"));
+  }
+  assert.ok(threwNotInSession, "lead_peer fora dos session peers deve lançar");
+  // (5) Explicit lead_peer ∈ session peers → entropy_source="explicit".
+  const exp = resolveLeadPeer("claude", "codex", ["codex", "gemini"]);
+  assert.equal(exp.kind, "explicit");
+  assert.equal(exp.assignment.assigned, "codex");
+  assert.equal(exp.assignment.entropy_source, "explicit");
+  console.log("[smoke] relator_lottery_session_peers_aware_test: PASS");
+}
+
+// v2.11.0 R-fix — auto-recusal filtra caller de selectedPeers.
+// Caller no input.peers deve ser removido da lista de revisores antes do
+// lottery (auto-recusal por sessão; em outras sessões caller continua peer).
+{
+  const events: Array<{ type: string; data?: Record<string, unknown> }> = [];
+  const cfg = {
+    ...loadConfig(),
+    data_dir: path.join(os.tmpdir(), `cross-review-v2-auto-recusal-${Date.now()}`),
+    budget: {
+      ...loadConfig().budget,
+      max_session_cost_usd: 10000,
+      preflight_max_round_cost_usd: 10000,
+      until_stopped_max_cost_usd: 10000,
+    },
+  };
+  const orch = new CrossReviewOrchestrator(cfg, (e) => events.push({ type: e.type, data: e.data }));
+  // caller=claude com peers=[codex,claude,gemini] → claude removido.
+  await orch.runUntilUnanimous({
+    task: "Auto-recusal smoke",
+    initial_draft: "Test draft.",
+    caller: "claude",
+    peers: ["codex", "claude", "gemini"],
+    max_rounds: 1,
+  });
+  const relatorEvents = events.filter((e) => e.type === "session.relator_assigned");
+  assert.equal(relatorEvents.length, 1);
+  const data = relatorEvents[0].data ?? {};
+  const pool = data.candidate_pool as string[];
+  assert.ok(!pool.includes("claude"), "auto-recusal: pool não pode conter claude");
+  assert.equal(pool.length, 2, `pool deve ter 2 peers (codex+gemini), got ${pool.length}`);
+  assert.ok(pool.every((p) => ["codex", "gemini"].includes(p)));
+  assert.ok(["codex", "gemini"].includes(data.assigned as string));
+  console.log("[smoke] relator_auto_recusal_filters_session_peers_test: PASS");
+}
+
 // v2.6.1 NOTE: smoke coverage for `peer.fallback.budget_blocked` and
 // `peer.moderation_recovery.budget_blocked` is intentionally NOT
 // included. These two gates use the same arithmetic shape as preflight

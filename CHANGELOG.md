@@ -9,6 +9,102 @@ standard `v00.00.00`; npm package versions remain SemVer.
 
 _No entries yet._
 
+## [v02.11.00] - 2026-05-03
+
+**Relator lottery (auto-recusal) + shadow-mode auto-wire of the v2.9.0 judge pass.** v2.11.0 bundles two items: (1) the relator lottery — a structural safeguard that prevents an agent from reviewing its own submission, modeled on judicial colegiados (operator directive 2026-05-03 after v2.10.0 wasted ~$2 USD across 4 trilaterals where caller=claude was also lead_peer=claude); and (2) the shadow-mode auto-wire originally planned for v2.10.0 (data-collection surface for the v2.9.0 judge pass before flipping to active mutation in v2.12+). The v2.10.0 release was rolled into v2.11.0 because v2.10's trilateral never converged validly under the broken self-review pattern.
+
+### Added (relator lottery — new in v2.11.0)
+
+- **`src/core/relator-lottery.ts` module.** Exports `assignRelator(caller, sessionPeers?)` (RNG via `crypto.randomInt` over `sessionPeers \ {caller}` — falls back to `PEERS \ {caller}` when the subset is omitted), `assertLeadPeerNotCaller(caller, leadPeer, sessionPeers?)` (throws `CallerCannotBeLeadPeerError` on self-review AND `LeadPeerNotInSessionError` when the explicit lead is not a participating peer), and `resolveLeadPeer(caller, leadPeer?, sessionPeers?)` that combines the two: when leadPeer omitted → lottery; when supplied → validate non-self AND in-session. **Session-peers-aware** (deepseek catch from R-fix trilateral): pre-fix, the lottery filtered the global `PEERS` constant, so a peer subset like `["codex","gemini"]` could produce a non-participating relator. Post-fix the lottery only picks from peers actually participating in the session.
+- **`caller` parameter on `RunUntilUnanimousInput`** + MCP schemas for `run_until_unanimous` and `session_start_unanimous`. Type: `PeerId | "operator"`. Default `"operator"` preserves v2.10.0 behavior (no exclusion). When set to a peer id, activates the lottery + self-recusal validation.
+- **`lead_peer` is now optional on the MCP schemas** (was `.default("codex")` in v2.10.0). When omitted with `caller === "operator"` the orchestrator still picks `"codex"` (v2.10.0 default preserved). When omitted with a peer caller, the lottery picks one of the 3 non-caller peers.
+- **`session.relator_assigned` event** — fires once per session when the lottery assigns a relator. Data: `{caller, candidate_pool, assigned, entropy_source: "crypto.randomInt", kind: "lottery"}`. Audit-trail-grade — operators can reconstruct the random draw post-hoc.
+- **`CallerCannotBeLeadPeerError`** — dedicated error class thrown when a caller explicitly passes `lead_peer === caller`. Message: `"caller_cannot_be_lead_peer: <caller> cannot review own submission. Submit without lead_peer to trigger automatic relator lottery, or pick a different non-caller peer (codex|claude|gemini|deepseek)."`. No silent fallback to lottery — operator must fix the call.
+- **Auto-recusal from reviewer pool (operator clarification 2026-05-03).** The caller is now also stripped from `input.peers` (the reviewer list) before the lottery runs and before any reviewer round dispatches. The auto-recusal is **per-session**: a peer that is the caller in this session is excluded here, but stays available as a reviewer in OTHER sessions where it is not the petitioner.
+- **`LeadPeerNotInSessionError`** — thrown when an explicit `lead_peer` is supplied but is not present in the session peers list. Prevents the orchestrator from assigning a non-participating relator.
+- **`entropy_source: "crypto.randomInt" | "explicit"`** on `RelatorAssignment`. Lottery assignments tag `"crypto.randomInt"`; explicit-leadpeer assignments tag `"explicit"` so audit trails can distinguish the two paths without reading the kind discriminant. (Pre-fix, both tagged `"crypto.randomInt"` — misleading because the explicit path uses no RNG.)
+- **Six new smoke markers** (4 lottery + 2 R-fix):
+  - `relator_lottery_excludes_caller_test` — 100 sorteios com caller=claude → assigned ∈ {codex,gemini,deepseek}; nunca claude. Plus 50 sorteios cada com caller=codex/gemini/deepseek (simetria) e 1 sorteio com caller=operator (pool size 4, sem exclusão).
+  - `relator_lottery_uniform_distribution_test` — 1500 sorteios com caller=claude. Counts dos 3 não-caller dentro de ±15% de 500 cada. Guard contra `Math.random` slipping in.
+  - `lead_peer_caller_match_rejected_test` — `assertLeadPeerNotCaller("claude", "claude")` joga `CallerCannotBeLeadPeerError`. Variantes válidas (caller=claude + lead=codex/gemini/deepseek) e operator caller também testadas.
+  - `relator_assigned_event_emitted_test` — `runUntilUnanimous({caller: "claude", lead_peer: undefined})` emite exatamente 1 evento `session.relator_assigned` com `caller`, `candidate_pool` (3 peers, sem claude), `assigned`, `entropy_source: "crypto.randomInt"`, `kind: "lottery"`.
+  - `relator_lottery_session_peers_aware_test` (R-fix) — subset com `peers=["codex","gemini"]` + caller=claude → assigned ∈ subset, nunca deepseek. Subset com 1 peer → assigned é exatamente esse peer. Subset apenas com caller → `no_eligible_relator`. Explicit `lead_peer="deepseek"` com session=`["codex","gemini"]` → `LeadPeerNotInSessionError`. Explicit válido → `entropy_source: "explicit"`.
+  - `relator_auto_recusal_filters_session_peers_test` (R-fix) — `runUntilUnanimous({caller: "claude", peers: ["codex","claude","gemini"]})` → caller removido do pool antes do lottery; `candidate_pool` retornado no evento tem 2 peers (codex+gemini), sem claude.
+
+### Added (shadow-mode auto-wire — originally drafted for v2.10.0, lifted into v2.11.0)
+
+- **`mode: "active" | "shadow"` parameter on `runEvidenceChecklistJudgePass`** in `core/orchestrator.ts`. Default `"active"` preserves the v2.9.0 contract (verified-satisfied judgments call `markEvidenceItemAddressedByJudge`). `"shadow"` routes the same per-item branches into a non-mutating path that records each verdict in a new `shadow_decisions` array on the return shape and emits `session.evidence_judge_pass.shadow_decision` events. The `started` and `completed` events also carry `mode` in `data` so dashboards can distinguish runs.
+- **`shadow_decisions: Array<{item_id, would_promote, satisfied, confidence, parser_warnings, rationale_empty, rationale}>`** on the orchestrator return shape and the MCP tool result. Always empty in active mode.
+- **`session.evidence_judge_pass.shadow_decision` event** — fires once per judged item in shadow mode. Data: `item_id`, `would_promote` (bool), `satisfied`, `confidence`, `judge_peer`. The `would_promote` flag is `true` only when the active path would have promoted (satisfied + verified + non-empty rationale + zero parser_warnings); all other verdicts carry `false`.
+- **askPeers auto-wire hook** — fires AFTER `runEvidenceChecklistAddressDetection` and BEFORE convergence finalization. Reads `CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_MODE` (`off | shadow`, case-insensitive, default `off`) and `CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_PEER` (one of `codex|claude|gemini|deepseek`). When mode=`shadow` and peer is valid, calls `runEvidenceChecklistJudgePass({mode: "shadow", draft: input.draft, round: round.round})`. Misconfiguration emits `session.evidence_judge_pass.autowire_skipped` (unknown mode, missing peer) or `session.evidence_judge_pass.autowire_failed` (judge call threw). Misconfig NEVER throws.
+- **MCP tool optional `shadow_mode: boolean`** on `session_evidence_judge_pass`. Default `false` keeps the v2.9.0 active contract; `true` forwards `mode: "shadow"` to the orchestrator.
+- **Boot-time notice** in `mcp/server.ts main()` for AUTOWIRE env-var validation. Three branches: invalid mode → notice + skip. mode=shadow but peer missing/invalid → notice + skip. mode=shadow + valid peer → notice acknowledging shadow mode active. All notices via `console.error`; runtime never throws on stray env values.
+- **Three smoke markers (carry-over from v2.10.0 draft)**:
+  - `evidence_judge_autowire_off_no_calls_test` — env unset → askPeers fires zero `session.evidence_judge_pass.*` events.
+  - `evidence_judge_autowire_shadow_emits_decision_test` — env=`shadow` + peer=`claude`. R1 produces a NEEDS_EVIDENCE item; R2 with `FORCE_NEEDS_EVIDENCE FORCE_JUDGE_SATISFIED` draft → `shadow_decision` event fires for the seed item with `would_promote=true`; on-disk status remains `open`.
+  - `evidence_judge_autowire_shadow_does_not_promote_test` — direct invariant: explicit `runEvidenceChecklistJudgePass({mode: "shadow"})` with FORCE_JUDGE_SATISFIED draft yields `promoted.length === 0`, `shadow_decisions.length === 1` with `would_promote=true`, no `addressed` history entry, no `address_method` set on disk.
+
+### Behavioral change (operator-visible)
+
+- **Auto-recusal is now structural.** Any caller (peer agent) submitting via MCP must pass `caller: "<own-id>"` and either omit `lead_peer` (lottery picks a non-caller) or pass `lead_peer` of a different peer. Passing `lead_peer === caller` is hard-rejected with `CallerCannotBeLeadPeerError`.
+- **Operator callers preserve v2.10.0 behavior.** When `caller` is omitted (defaults to `"operator"`) or explicitly set to `"operator"`, no exclusion applies and the v2.10.0 default `lead_peer="codex"` kicks in for omitted lead.
+- **Shadow auto-wire env knobs** `CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_MODE` (default `off`) and `CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_PEER` (no default; required when mode=shadow). When configured, every `askPeers` round adds one judge call per open checklist item (capped via `CROSS_REVIEW_V2_EVIDENCE_JUDGE_MAX_ITEMS_PER_PASS`, default 8). Judge cost tracked through the same FinOps path as generations.
+- Default behavior (no env set, no caller passed) is identical to v2.10.0 / v2.9.0.
+
+### Validation
+
+- **`npm run typecheck`** clean.
+- **`npm run format:check`** clean.
+- **`npm run lint`** clean.
+- **`npm run smoke`** EXIT=0 with PASS markers for the 4 lottery + 3 shadow auto-wire markers plus all v2.7-v2.9 carry-overs.
+- **Cross-review-v2 trilateral session [pending]** caller=claude, lead_peer omitido (sorteio) ou explícito ≠claude. HARD GATE 2026-04-26 + Self-Review Prohibition (2026-05-03) enforced before push.
+
+### Out of scope (deferred to v2.12+)
+
+- **Active-mode auto-wire** (mutating). Will ship after v2.11 shadow data shows acceptable single-judge precision.
+- **Multi-peer judge consensus.**
+- **Judgment caching across rounds.**
+- **Judge-induced retry on `unknown` confidence.**
+
+### Note: v2.10.0 was never released
+
+- v2.10.0 was drafted with the shadow auto-wire bundle but its trilateral cross-review never converged validly because the caller (claude) set `lead_peer=claude` — auto-loop of self-review producing meta-review drift. After 4 trilateral attempts (~$2 USD spent), operator detected the violation and authorized rolling v2.10.0's deliverables into v2.11.0 alongside the relator lottery as the structural safeguard. The pre-v2.11 git tags jump from `v2.9.0` directly to `v2.11.0`; no `v2.10.0` tag exists in the repo.
+
+### Added
+
+- **`mode: "active" | "shadow"` parameter on `runEvidenceChecklistJudgePass`** in `core/orchestrator.ts`. Default `"active"` preserves the v2.9.0 contract (verified-satisfied judgments call `markEvidenceItemAddressedByJudge`). `"shadow"` routes the same per-item branches into a non-mutating path that records each verdict in a new `shadow_decisions` array on the return shape and emits `session.evidence_judge_pass.shadow_decision` events. The `started` and `completed` events also carry `mode` in `data` so dashboards can distinguish runs.
+- **`shadow_decisions: Array<{item_id, would_promote, satisfied, confidence, parser_warnings, rationale_empty, rationale}>`** on the orchestrator return shape and the MCP tool result. Always empty in active mode.
+- **`mode: "active" | "shadow"`** on the `session.evidence_judge_pass.completed` and `started` event payloads.
+- **`session.evidence_judge_pass.shadow_decision` event** — fires once per judged item in shadow mode. Data: `item_id`, `would_promote` (bool), `satisfied`, `confidence`, `judge_peer`. The `would_promote` flag is `true` only when the active path would have promoted (satisfied + verified + non-empty rationale + zero parser_warnings); all other verdicts carry `false`. This is the operator-facing signal for empirical judgment quality.
+- **askPeers auto-wire hook** — fires AFTER `runEvidenceChecklistAddressDetection` and BEFORE convergence finalization. Reads `CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_MODE` (`off | shadow`, case-insensitive, default `off`) and `CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_PEER` (one of `codex|claude|gemini|deepseek`). When mode=`shadow` and peer is valid, calls `runEvidenceChecklistJudgePass({mode: "shadow", draft: input.draft, round: round.round})`. Misconfiguration paths emit `session.evidence_judge_pass.autowire_skipped` (unknown mode, missing peer) or `session.evidence_judge_pass.autowire_failed` (judge call threw). Misconfig NEVER throws — a typo cannot break a paying review round.
+- **MCP tool optional `shadow_mode: boolean`** on `session_evidence_judge_pass`. Default `false` keeps the v2.9.0 active contract; `true` forwards `mode: "shadow"` to the orchestrator. Operators can dogfood shadow on individual items without enabling the env-driven auto-wire.
+- **Boot-time notice** in `mcp/server.ts main()`. Three branches: (1) `MODE` is set to a value other than `off`/`shadow` → notice + skip. (2) `MODE=shadow` but `PEER` missing/invalid → notice + skip. (3) `MODE=shadow` + valid peer → notice acknowledging shadow mode is active. Notices go to `stderr`; runtime never throws on stray env values.
+- **Three new smoke markers**:
+  - `evidence_judge_autowire_off_no_calls_test` — env unset → askPeers fires zero `session.evidence_judge_pass.*` events. Locks in the v2.9.0 backcompat contract.
+  - `evidence_judge_autowire_shadow_emits_decision_test` — env=`shadow` + peer=`claude`. R1 produces a NEEDS_EVIDENCE item; R2 with `FORCE_NEEDS_EVIDENCE FORCE_JUDGE_SATISFIED` draft (peer raises ask again to keep it open after address detection; judge says verified-satisfied) → `shadow_decision` event fires for the seed item with `would_promote=true`; on-disk status remains `open`; `address_method` and `judge_rationale` remain undefined.
+  - `evidence_judge_autowire_shadow_does_not_promote_test` — direct invariant: explicit `runEvidenceChecklistJudgePass({mode: "shadow"})` with FORCE_JUDGE_SATISFIED draft yields `promoted.length === 0`, `shadow_decisions.length === 1` with `would_promote=true`, no `addressed` history entry, no `address_method` set on disk. Mirrors the v2.8.0/v2.9.0 terminal-preservation pattern but for the shadow code path.
+
+### Behavioral change (operator-visible)
+
+- New env knobs `CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_MODE` (default `off`) and `CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_PEER` (no default; required when mode=shadow). When configured, every `askPeers` round adds one judge call per open checklist item (capped via the existing `CROSS_REVIEW_V2_EVIDENCE_JUDGE_MAX_ITEMS_PER_PASS`, default 8). Judge cost is tracked through the same FinOps path as generations — operators see real spend even in shadow mode.
+- Default behavior (no env set) is identical to v2.9.0; nothing changes for callers that have not opted in.
+- Shadow-mode runs leave the evidence checklist byte-identical to a no-judge run: state, status, audit history are all untouched. Only events are added.
+
+### Validation
+
+- **`npm run typecheck`** clean.
+- **`npm run format:check`** clean.
+- **`npm run lint`** clean.
+- **`npm run smoke`** EXIT=0 with PASS markers for the v2.10.0 trio plus all v2.7-v2.9 carry-overs.
+- **Cross-review-v2 trilateral session [pending]** caller=claude, peers=codex+gemini+deepseek. HARD GATE 2026-04-26 enforced before push.
+
+### Out of scope (deferred to v2.11+)
+
+- **Active-mode auto-wire** (mutating). Will ship after v2.10 shadow data shows acceptable single-judge precision.
+- **Multi-peer judge consensus.**
+- **Judgment caching across rounds.**
+- **Judge-induced retry on `unknown` confidence.**
+
 ## [v02.09.00] - 2026-05-03
 
 **LLM-based satisfied detection for the Evidence Broker (operator-triggered judge pass).** v2.8.0 closed the architectural backlog with heuristic resurfacing-inference (1-round-late signal: a peer that does not bring an ask back next round → addressed). v2.9.0 adds the explicit second signal that was deferred: an operator-triggered LLM judge pass that reads `(ask, draft)` pairs and rules whether the new draft satisfies each open ask. Confidence floor is `verified` only; `inferred` and `unknown` leave items open. Operator-set terminal statuses (`satisfied`/`deferred`/`rejected`) and items already auto-promoted are NEVER touched. Surface is one MCP tool only — auto-wiring into `askPeers` is intentionally deferred to v2.10+ until empirical judgment quality data is available.

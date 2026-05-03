@@ -26,6 +26,7 @@ import { missingFinancialControlVars } from "./config.js";
 import { classifyProviderError } from "../peers/errors.js";
 import { resolveBestModels } from "../peers/model-selection.js";
 import { createAdapters, selectAdapters } from "../peers/registry.js";
+import { resolveLeadPeer } from "./relator-lottery.js";
 import { redact } from "../security/redact.js";
 
 export interface AskPeersInput {
@@ -56,6 +57,13 @@ export interface RunUntilUnanimousInput {
   until_stopped?: boolean;
   max_cost_usd?: number;
   signal?: AbortSignal;
+  // v2.11.0: caller identifies the petitioner (peer or operator) for the
+  // relator-lottery + self-review prohibition. Defaults to "operator" when
+  // omitted, which preserves v2.10.0 behavior (no exclusion). When caller
+  // is one of the four peer ids, the orchestrator (a) rejects an explicit
+  // lead_peer === caller and (b) runs the lottery to pick a non-caller
+  // relator when lead_peer is omitted.
+  caller?: PeerId | "operator";
 }
 
 export interface RunUntilUnanimousOutput {
@@ -606,6 +614,14 @@ export class CrossReviewOrchestrator {
     item_ids?: string[];
     round?: number;
     review_focus?: string;
+    // v2.10.0: "active" preserves the v2.9.0 contract — promotes items
+    // when the judge returns satisfied + verified. "shadow" routes the
+    // same judgments through a non-mutating path that emits
+    // `session.evidence_judge_pass.shadow_decision` per item with a
+    // `would_promote` flag. Operators use shadow to collect empirical
+    // judgment-quality data BEFORE flipping to active. Defaults to
+    // "active" so existing v2.9.0 callers behave identically.
+    mode?: "active" | "shadow";
   }): Promise<{
     promoted: Array<{
       item_id: string;
@@ -620,8 +636,21 @@ export class CrossReviewOrchestrator {
       confidence?: Confidence;
       message?: string;
     }>;
+    // v2.10.0: shadow-mode-only output. In active mode this array is
+    // always empty. In shadow mode it carries one entry per judged item
+    // with the verdict the active path WOULD have applied.
+    shadow_decisions: Array<{
+      item_id: string;
+      would_promote: boolean;
+      satisfied: boolean;
+      confidence: Confidence;
+      parser_warnings: string[];
+      rationale_empty: boolean;
+      rationale: string;
+    }>;
     judged_count: number;
     capped: boolean;
+    mode: "active" | "shadow";
   }> {
     const meta = this.store.read(params.session_id);
     const checklist = meta.evidence_checklist ?? [];
@@ -637,6 +666,7 @@ export class CrossReviewOrchestrator {
           8,
       ),
     );
+    const mode: "active" | "shadow" = params.mode ?? "active";
     const filterIds = params.item_ids?.length ? new Set(params.item_ids) : null;
     const candidates = checklist.filter((item) => {
       if (filterIds && !filterIds.has(item.id)) return false;
@@ -644,6 +674,15 @@ export class CrossReviewOrchestrator {
     });
     const capped = candidates.length > cap;
     const queue = candidates.slice(0, cap);
+    const shadowDecisions: Array<{
+      item_id: string;
+      would_promote: boolean;
+      satisfied: boolean;
+      confidence: Confidence;
+      parser_warnings: string[];
+      rationale_empty: boolean;
+      rationale: string;
+    }> = [];
     // Round used for history attribution. If caller did not specify a
     // round (e.g. operator-triggered judgment between rounds), derive
     // from the highest round on the session — that is the round whose
@@ -668,8 +707,8 @@ export class CrossReviewOrchestrator {
       type: "session.evidence_judge_pass.started",
       session_id: params.session_id,
       round: judgmentRound,
-      message: `Running judge pass on ${queue.length} open item(s) via ${params.judge_peer} (cap ${cap}).`,
-      data: { judge_peer: params.judge_peer, items_queued: queue.length, capped },
+      message: `Running judge pass (${mode}) on ${queue.length} open item(s) via ${params.judge_peer} (cap ${cap}).`,
+      data: { judge_peer: params.judge_peer, items_queued: queue.length, capped, mode },
     });
 
     for (const item of queue) {
@@ -734,49 +773,133 @@ export class CrossReviewOrchestrator {
             },
           });
         } else if (judgment.satisfied && judgment.confidence === "verified") {
-          const result = this.store.markEvidenceItemAddressedByJudge(params.session_id, item.id, {
-            round: judgmentRound,
-            rationale: judgment.rationale,
-            judge_peer: params.judge_peer,
-          });
-          if (result) {
-            promoted.push({
+          if (mode === "shadow") {
+            // v2.10.0 shadow mode: record what active mode WOULD have
+            // promoted, but never call markEvidenceItemAddressedByJudge.
+            // The session.evidence_judge_pass.shadow_decision event is the
+            // operator-visible signal; checklist state stays untouched so
+            // the next round's prompt still surfaces the ask under
+            // "Outstanding Evidence Asks".
+            shadowDecisions.push({
               item_id: item.id,
-              rationale: result.item.judge_rationale ?? judgment.rationale,
-              usage: judgment.usage,
-              cost: judgment.cost,
+              would_promote: true,
+              satisfied: judgment.satisfied,
+              confidence: judgment.confidence,
+              parser_warnings: judgment.parser_warnings,
+              rationale_empty: false,
+              rationale: judgment.rationale,
             });
             this.emit({
-              type: "session.evidence_checklist_addressed",
+              type: "session.evidence_judge_pass.shadow_decision",
               session_id: params.session_id,
               round: judgmentRound,
-              message: `Judge promoted ${item.id} to addressed (${params.judge_peer}).`,
+              peer: params.judge_peer,
+              message: `Shadow judgment on ${item.id}: would promote (verified).`,
               data: {
-                ids: [item.id],
-                count: 1,
-                method: "judge",
+                item_id: item.id,
+                would_promote: true,
+                satisfied: judgment.satisfied,
+                confidence: judgment.confidence,
                 judge_peer: params.judge_peer,
               },
             });
           } else {
-            // Concurrent mutation between filter and lock — item already
-            // moved to a non-open state. Treat as not_open.
-            skipped.push({ item_id: item.id, reason: "not_open" });
+            const result = this.store.markEvidenceItemAddressedByJudge(params.session_id, item.id, {
+              round: judgmentRound,
+              rationale: judgment.rationale,
+              judge_peer: params.judge_peer,
+            });
+            if (result) {
+              promoted.push({
+                item_id: item.id,
+                rationale: result.item.judge_rationale ?? judgment.rationale,
+                usage: judgment.usage,
+                cost: judgment.cost,
+              });
+              this.emit({
+                type: "session.evidence_checklist_addressed",
+                session_id: params.session_id,
+                round: judgmentRound,
+                message: `Judge promoted ${item.id} to addressed (${params.judge_peer}).`,
+                data: {
+                  ids: [item.id],
+                  count: 1,
+                  method: "judge",
+                  judge_peer: params.judge_peer,
+                },
+              });
+            } else {
+              // Concurrent mutation between filter and lock — item already
+              // moved to a non-open state. Treat as not_open.
+              skipped.push({ item_id: item.id, reason: "not_open" });
+            }
           }
         } else if (judgment.satisfied) {
-          skipped.push({
-            item_id: item.id,
-            reason: "satisfied_but_unverified",
-            satisfied: judgment.satisfied,
-            confidence: judgment.confidence,
-          });
+          if (mode === "shadow") {
+            shadowDecisions.push({
+              item_id: item.id,
+              would_promote: false,
+              satisfied: judgment.satisfied,
+              confidence: judgment.confidence,
+              parser_warnings: judgment.parser_warnings,
+              rationale_empty: false,
+              rationale: judgment.rationale,
+            });
+            this.emit({
+              type: "session.evidence_judge_pass.shadow_decision",
+              session_id: params.session_id,
+              round: judgmentRound,
+              peer: params.judge_peer,
+              message: `Shadow judgment on ${item.id}: would not promote (satisfied but ${judgment.confidence}).`,
+              data: {
+                item_id: item.id,
+                would_promote: false,
+                satisfied: judgment.satisfied,
+                confidence: judgment.confidence,
+                judge_peer: params.judge_peer,
+              },
+            });
+          } else {
+            skipped.push({
+              item_id: item.id,
+              reason: "satisfied_but_unverified",
+              satisfied: judgment.satisfied,
+              confidence: judgment.confidence,
+            });
+          }
         } else {
-          skipped.push({
-            item_id: item.id,
-            reason: "not_satisfied",
-            satisfied: judgment.satisfied,
-            confidence: judgment.confidence,
-          });
+          if (mode === "shadow") {
+            shadowDecisions.push({
+              item_id: item.id,
+              would_promote: false,
+              satisfied: judgment.satisfied,
+              confidence: judgment.confidence,
+              parser_warnings: judgment.parser_warnings,
+              rationale_empty: false,
+              rationale: judgment.rationale,
+            });
+            this.emit({
+              type: "session.evidence_judge_pass.shadow_decision",
+              session_id: params.session_id,
+              round: judgmentRound,
+              peer: params.judge_peer,
+              message: `Shadow judgment on ${item.id}: would not promote (not satisfied).`,
+              data: {
+                item_id: item.id,
+                would_promote: false,
+                satisfied: judgment.satisfied,
+                confidence: judgment.confidence,
+                judge_peer: params.judge_peer,
+              },
+            });
+          } else {
+            skipped.push({
+              item_id: item.id,
+              reason: "not_satisfied",
+              satisfied: judgment.satisfied,
+              confidence: judgment.confidence,
+            });
+          }
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -796,16 +919,28 @@ export class CrossReviewOrchestrator {
       type: "session.evidence_judge_pass.completed",
       session_id: params.session_id,
       round: judgmentRound,
-      message: `Judge pass complete: ${promoted.length} promoted, ${skipped.length} skipped.`,
+      message:
+        mode === "shadow"
+          ? `Judge pass (shadow) complete: ${shadowDecisions.length} decision(s) recorded, no mutations.`
+          : `Judge pass (active) complete: ${promoted.length} promoted, ${skipped.length} skipped.`,
       data: {
         judge_peer: params.judge_peer,
+        mode,
         promoted_count: promoted.length,
         skipped_count: skipped.length,
+        shadow_decision_count: shadowDecisions.length,
         capped,
       },
     });
 
-    return { promoted, skipped, judged_count: queue.length, capped };
+    return {
+      promoted,
+      skipped,
+      shadow_decisions: shadowDecisions,
+      judged_count: queue.length,
+      capped,
+      mode,
+    };
   }
 
   async initSession(
@@ -1658,6 +1793,67 @@ export class CrossReviewOrchestrator {
         });
       }
     }
+    // v2.10.0 — opt-in shadow-mode judge auto-wire. When the operator sets
+    // CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_MODE=shadow + a valid peer in
+    // CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_PEER, the runtime fires the
+    // judge pass against `input.draft` (the round's submitted draft) for
+    // items in `open` status AFTER aggregation + address detection ran.
+    // Mode "shadow" emits session.evidence_judge_pass.shadow_decision events
+    // per item but NEVER mutates state — operators collect empirical
+    // judgment-quality data before flipping to active in v2.11+. Misconfig
+    // (missing peer, unknown peer) emits a single warning event and is
+    // otherwise a no-op so a typo never crashes a paying review round.
+    const autowireMode = (process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_MODE ?? "off")
+      .trim()
+      .toLowerCase();
+    if (autowireMode === "shadow") {
+      const autowirePeerRaw = (
+        process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_PEER ?? ""
+      ).trim();
+      const autowirePeer = autowirePeerRaw as PeerId;
+      const validPeer = (PEERS as readonly string[]).includes(autowirePeer);
+      const checklistAfter = this.store.read(session.session_id).evidence_checklist ?? [];
+      const hasOpenItems = checklistAfter.some((item) => (item.status ?? "open") === "open");
+      if (!validPeer) {
+        this.emit({
+          type: "session.evidence_judge_pass.autowire_skipped",
+          session_id: session.session_id,
+          round: round.round,
+          message: `Autowire enabled but CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_PEER is missing or unknown (got "${autowirePeerRaw}"); shadow pass skipped.`,
+          data: { mode: autowireMode, configured_peer: autowirePeerRaw },
+        });
+      } else if (!hasOpenItems) {
+        // No open items → nothing to judge. Skip silently to avoid
+        // event-log noise on every converged round.
+      } else {
+        try {
+          await this.runEvidenceChecklistJudgePass({
+            session_id: session.session_id,
+            judge_peer: autowirePeer,
+            draft: input.draft,
+            round: round.round,
+            mode: "shadow",
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          this.emit({
+            type: "session.evidence_judge_pass.autowire_failed",
+            session_id: session.session_id,
+            round: round.round,
+            message: `Autowire shadow pass failed: ${message}`,
+            data: { mode: autowireMode, judge_peer: autowirePeer, error: message },
+          });
+        }
+      }
+    } else if (autowireMode !== "off" && autowireMode !== "") {
+      this.emit({
+        type: "session.evidence_judge_pass.autowire_skipped",
+        session_id: session.session_id,
+        round: round.round,
+        message: `Autowire mode "${autowireMode}" is not recognized; valid values are "off" and "shadow". Skipped.`,
+        data: { mode: autowireMode },
+      });
+    }
     let updated = this.store.read(session.session_id);
     if (convergence.converged) {
       this.store.saveFinal(session.session_id, input.draft);
@@ -1685,7 +1881,58 @@ export class CrossReviewOrchestrator {
   }
 
   async runUntilUnanimous(input: RunUntilUnanimousInput): Promise<RunUntilUnanimousOutput> {
-    const leadPeer = input.lead_peer ?? "codex";
+    // v2.11.0: relator lottery + auto-recusal from reviewer pool.
+    //
+    // Per workspace HARD GATE 2026-05-03 (an agent never reviews its own
+    // submission), the caller is excluded from BOTH the lead_peer slot AND
+    // the reviewer-peers list of the SAME session. The caller stays
+    // available as a reviewer in OTHER sessions where it is not the
+    // petitioner — auto-recusal is per-session, not global.
+    //
+    // Order matters: selectedPeers must be filtered BEFORE the lottery,
+    // because the lottery's candidate pool is the session peers list (NOT
+    // the global PEERS) so a peer subset like ["codex","gemini"] never
+    // produces a non-participating relator like "deepseek". This is the
+    // session-aware fix from the v2.11.0 R-fix trilateral (deepseek catch
+    // session 38c6c076).
+    const callerForLottery: PeerId | "operator" = input.caller ?? "operator";
+    const requestedPeers = input.peers?.length ? input.peers : [...PEERS];
+    // Auto-recusal: drop the caller from the reviewer pool when caller is
+    // a peer id. Operator caller is left as-is (operator is not a peer).
+    const sessionPeers: PeerId[] =
+      callerForLottery === "operator"
+        ? requestedPeers
+        : requestedPeers.filter((peer) => peer !== callerForLottery);
+
+    let leadPeer: PeerId;
+    if (callerForLottery === "operator") {
+      // Pre-v2.11.0 behavior preserved for operator callers.
+      if (input.lead_peer !== undefined) {
+        leadPeer = input.lead_peer;
+      } else {
+        leadPeer = "codex";
+      }
+    } else {
+      // v2.11.0 fix: pass sessionPeers so the lottery picks ONLY from
+      // peers participating in this session, never a non-participating
+      // global peer. assertLeadPeerNotCaller (called inside resolveLeadPeer
+      // when lead_peer is explicit) also validates lead_peer ∈ sessionPeers.
+      const resolution = resolveLeadPeer(callerForLottery, input.lead_peer, sessionPeers);
+      leadPeer = resolution.assignment.assigned;
+      if (resolution.kind === "lottery") {
+        this.emit({
+          type: "session.relator_assigned",
+          message: `Relator lottery: caller=${callerForLottery} → assigned=${leadPeer} (excluded from pool: ${callerForLottery}).`,
+          data: {
+            caller: callerForLottery,
+            candidate_pool: resolution.assignment.candidate_pool,
+            assigned: leadPeer,
+            entropy_source: resolution.assignment.entropy_source,
+            kind: "lottery",
+          },
+        });
+      }
+    }
     const baseMaxRounds = input.until_stopped
       ? Number.MAX_SAFE_INTEGER
       : input.max_rounds && input.max_rounds > 0
@@ -1709,7 +1956,11 @@ export class CrossReviewOrchestrator {
     const costLimit = budgetLimit(this.config, input.max_cost_usd, {
       untilStopped: input.until_stopped,
     });
-    const selectedPeers = input.peers?.length ? input.peers : [...PEERS];
+    // v2.11.0: selectedPeers was already computed + caller-filtered above
+    // (sessionPeers). Reuse it here instead of re-deriving from input.peers
+    // so the auto-recusal applied for the lottery also propagates to the
+    // reviewer pool that downstream rounds see.
+    const selectedPeers = sessionPeers;
     const chargeablePeers = uniquePeers([...selectedPeers, leadPeer]);
     const missingFinancialVars = missingFinancialControlVars(this.config, chargeablePeers, {
       untilStopped: input.until_stopped,
