@@ -1541,6 +1541,343 @@ assert.equal(Object.hasOwn(metrics.decision_quality, "undefined"), false);
   console.log("[smoke] evidence_broker_aggregate_dedupe_test: PASS");
 }
 
+// v2.8.0 Terminal-Preservation Regression: locks in the rule that
+// runEvidenceChecklistAddressDetection NEVER auto-mutates an item in a
+// terminal operator status (satisfied/deferred/rejected) and that an
+// open item resurfaced in the current round is not misclassified under
+// peer_resurfaced_terminal. Codex+deepseek surfaced the regression risk
+// during the v2.8.0 trilateral cross-review (a buggy truthy-OR form
+// `(status === "satisfied" || "deferred" || "rejected")` would have
+// matched all non-empty strings). The runtime now uses
+// `SessionStore.TERMINAL_STATUSES.has(status)`, but this test guards
+// against the pattern reappearing in any future refactor.
+{
+  const tpConfig = {
+    ...loadConfig(),
+    data_dir: path.join(os.tmpdir(), `cross-review-v2-terminal-preservation-${Date.now()}`),
+    budget: {
+      ...loadConfig().budget,
+      max_session_cost_usd: 10000,
+      preflight_max_round_cost_usd: 10000,
+      until_stopped_max_cost_usd: 10000,
+    },
+  };
+  const tpOrch = new CrossReviewOrchestrator(tpConfig, () => {});
+  // Bootstrap a session with a NEEDS_EVIDENCE round so the checklist
+  // exists, then hand-craft 5 items with the statuses we want to probe.
+  const initial = await tpOrch.askPeers({
+    task: "Terminal preservation smoke: probe Set membership on resurfacing inference.",
+    draft: "FORCE_NEEDS_EVIDENCE",
+    caller: "operator",
+    peers: ["claude"],
+  });
+  const sessionId = initial.session.session_id;
+  // Replace the auto-built checklist with a deterministic 5-item fixture
+  // — atomic write under withSessionLock to mirror production semantics.
+  const FIXTURE_ROUND = 7;
+  const fixtureItems = [
+    {
+      id: "0000000000000001",
+      peer: "claude" as const,
+      first_round: 1,
+      last_round: FIXTURE_ROUND,
+      round_count: 4,
+      ask: "open item resurfaced in current round",
+      first_seen_at: "2026-05-03T00:00:00Z",
+      last_seen_at: "2026-05-03T00:00:00Z",
+      status: "open" as const,
+    },
+    {
+      id: "0000000000000002",
+      peer: "claude" as const,
+      first_round: 1,
+      last_round: FIXTURE_ROUND,
+      round_count: 4,
+      ask: "satisfied item resurfaced in current round",
+      first_seen_at: "2026-05-03T00:00:00Z",
+      last_seen_at: "2026-05-03T00:00:00Z",
+      status: "satisfied" as const,
+    },
+    {
+      id: "0000000000000003",
+      peer: "claude" as const,
+      first_round: 1,
+      last_round: FIXTURE_ROUND,
+      round_count: 4,
+      ask: "deferred item resurfaced in current round",
+      first_seen_at: "2026-05-03T00:00:00Z",
+      last_seen_at: "2026-05-03T00:00:00Z",
+      status: "deferred" as const,
+    },
+    {
+      id: "0000000000000004",
+      peer: "claude" as const,
+      first_round: 1,
+      last_round: FIXTURE_ROUND,
+      round_count: 4,
+      ask: "rejected item resurfaced in current round",
+      first_seen_at: "2026-05-03T00:00:00Z",
+      last_seen_at: "2026-05-03T00:00:00Z",
+      status: "rejected" as const,
+    },
+    {
+      id: "0000000000000005",
+      peer: "claude" as const,
+      first_round: 1,
+      last_round: FIXTURE_ROUND,
+      round_count: 4,
+      ask: "addressed item resurfaced in current round",
+      first_seen_at: "2026-05-03T00:00:00Z",
+      last_seen_at: "2026-05-03T00:00:00Z",
+      status: "addressed" as const,
+    },
+  ];
+  // Atomically replace the checklist on disk.
+  const meta = tpOrch.store.read(sessionId);
+  meta.evidence_checklist = fixtureItems;
+  fs.writeFileSync(
+    path.join(tpConfig.data_dir, "sessions", sessionId, "meta.json"),
+    JSON.stringify(meta, null, 2),
+  );
+  const ad = tpOrch.store.runEvidenceChecklistAddressDetection(sessionId, FIXTURE_ROUND);
+  // (1) The open item with last_round===currentRound MUST NOT appear under
+  //     peer_resurfaced_terminal. This is the regression the buggy
+  //     truthy-OR predicate would have triggered.
+  assert.ok(
+    !ad.peer_resurfaced_terminal.some((entry) => entry.id === "0000000000000001"),
+    "open item resurfaced in current round must not be classified as terminal",
+  );
+  // (2) Open item with last_round===currentRound is left alone (no auto-promote, no reopen).
+  assert.ok(
+    !ad.addressed.some((entry) => entry.id === "0000000000000001"),
+    "open item must not be auto-promoted when last_round===currentRound",
+  );
+  assert.ok(
+    !ad.reopened.some((entry) => entry.id === "0000000000000001"),
+    "open item is not reopened (it was never addressed)",
+  );
+  // (3) All three terminal items MUST appear under peer_resurfaced_terminal.
+  const terminalIds = new Set(ad.peer_resurfaced_terminal.map((entry) => entry.id));
+  assert.ok(terminalIds.has("0000000000000002"), "satisfied item must be reported terminal");
+  assert.ok(terminalIds.has("0000000000000003"), "deferred item must be reported terminal");
+  assert.ok(terminalIds.has("0000000000000004"), "rejected item must be reported terminal");
+  // (4) Terminal items' statuses are PRESERVED on disk after the pass.
+  const after = tpOrch.store.read(sessionId);
+  assert.equal(
+    after.evidence_checklist?.find((entry) => entry.id === "0000000000000002")?.status,
+    "satisfied",
+  );
+  assert.equal(
+    after.evidence_checklist?.find((entry) => entry.id === "0000000000000003")?.status,
+    "deferred",
+  );
+  assert.equal(
+    after.evidence_checklist?.find((entry) => entry.id === "0000000000000004")?.status,
+    "rejected",
+  );
+  // (5) Addressed item with last_round===currentRound reverts to open
+  //     (lifecycle reopen path).
+  assert.ok(
+    ad.reopened.some((entry) => entry.id === "0000000000000005"),
+    "addressed item resurfaced must revert to open",
+  );
+  assert.equal(
+    after.evidence_checklist?.find((entry) => entry.id === "0000000000000005")?.status,
+    "open",
+  );
+  // (6) Terminal items are NOT in addressed[] or reopened[] — operator-owned, never auto-mutated.
+  assert.ok(!ad.addressed.some((entry) => terminalIds.has(entry.id)));
+  assert.ok(!ad.reopened.some((entry) => terminalIds.has(entry.id)));
+  console.log("[smoke] evidence_checklist_terminal_preservation_test: PASS");
+}
+
+// v2.8.0 Address Detection: an open evidence checklist item whose peer
+// did NOT resurface the same ask in the next round is auto-promoted to
+// "addressed" via resurfacing-inference. The promotion is durable (lives
+// in meta.evidence_status_history) and the next revision prompt no
+// longer surfaces the item under "Outstanding Evidence Asks".
+{
+  const adEvents: string[] = [];
+  const adConfig = {
+    ...loadConfig(),
+    data_dir: path.join(os.tmpdir(), `cross-review-v2-address-detection-${Date.now()}`),
+    budget: {
+      ...loadConfig().budget,
+      max_session_cost_usd: 10000,
+      preflight_max_round_cost_usd: 10000,
+      until_stopped_max_cost_usd: 10000,
+    },
+  };
+  const adOrch = new CrossReviewOrchestrator(adConfig, (event) => adEvents.push(event.type));
+  const adTask =
+    "Address Detection smoke: R1 NEEDS_EVIDENCE then R2 clean draft must auto-address.";
+  const adRound1 = await adOrch.askPeers({
+    task: adTask,
+    draft: "FORCE_NEEDS_EVIDENCE",
+    caller: "operator",
+    peers: ["claude"],
+  });
+  const r1List = adRound1.session.evidence_checklist ?? [];
+  assert.equal(r1List.length, 1, `R1 must produce 1 checklist item, got ${r1List.length}`);
+  assert.equal(r1List[0]?.status ?? "open", "open", "R1 item must be open after first round");
+  // R2 with a clean draft (no FORCE marker) — claude returns READY, no new
+  // ask, address-detection promotes R1's open item to "addressed".
+  const adRound2 = await adOrch.askPeers({
+    session_id: adRound1.session.session_id,
+    task: adTask,
+    draft: "Clean revised draft, no test marker present.",
+    caller: "operator",
+    peers: ["claude"],
+  });
+  const r2List = adRound2.session.evidence_checklist ?? [];
+  assert.equal(r2List.length, 1, `R2 must keep 1 item (no new ask), got ${r2List.length}`);
+  assert.equal(
+    r2List[0]?.status,
+    "addressed",
+    `R2 item must be addressed, got ${r2List[0]?.status}`,
+  );
+  assert.equal(r2List[0]?.addressed_at_round, 2, "addressed_at_round must be 2");
+  const history = adRound2.session.evidence_status_history ?? [];
+  assert.ok(
+    history.some(
+      (entry) => entry.to === "addressed" && entry.by === "runtime" && entry.round === 2,
+    ),
+    "history must record runtime promotion to addressed in round 2",
+  );
+  assert.ok(
+    adEvents.some((e) => e === "session.evidence_checklist_addressed"),
+    "must emit session.evidence_checklist_addressed",
+  );
+  console.log("[smoke] evidence_checklist_address_detection_test: PASS");
+}
+
+// v2.8.0 Operator Status Update: setEvidenceChecklistItemStatus mutates
+// item.status under the session lock, appends an audit entry, and the
+// next revision prompt must NOT surface terminal-status items in the
+// "Outstanding Evidence Asks" block.
+{
+  const opConfig = {
+    ...loadConfig(),
+    data_dir: path.join(os.tmpdir(), `cross-review-v2-operator-status-${Date.now()}`),
+    budget: {
+      ...loadConfig().budget,
+      max_session_cost_usd: 10000,
+      preflight_max_round_cost_usd: 10000,
+      until_stopped_max_cost_usd: 10000,
+    },
+  };
+  const opOrch = new CrossReviewOrchestrator(opConfig, () => {});
+  const opTask =
+    "Operator status smoke: mark item satisfied, history persists, prompt suppresses it.";
+  const opRound1 = await opOrch.askPeers({
+    task: opTask,
+    draft: "FORCE_NEEDS_EVIDENCE",
+    caller: "operator",
+    peers: ["claude"],
+  });
+  const item = opRound1.session.evidence_checklist?.[0];
+  assert.ok(item, "R1 must produce a checklist item");
+  const result = opOrch.store.setEvidenceChecklistItemStatus(
+    opRound1.session.session_id,
+    item.id,
+    "satisfied",
+    { note: "smoke verified manually", by: "operator" },
+  );
+  assert.equal(result.item.status, "satisfied", "mutator must set status to satisfied");
+  assert.equal(result.history_entry.from, "open");
+  assert.equal(result.history_entry.to, "satisfied");
+  assert.equal(result.history_entry.by, "operator");
+  assert.equal(result.history_entry.note, "smoke verified manually");
+  const after = opOrch.store.read(opRound1.session.session_id);
+  const persisted = after.evidence_checklist?.find((entry) => entry.id === item.id);
+  assert.equal(persisted?.status, "satisfied", "persisted item must reflect satisfied");
+  assert.ok(
+    (after.evidence_status_history ?? []).some((entry) => entry.to === "satisfied"),
+    "history must persist the satisfied transition",
+  );
+  // Round 2 with a fresh FORCE_NEEDS_EVIDENCE draft would normally
+  // re-surface the same ask — but since we just marked it satisfied, the
+  // address-detection pass is the second concern. The first concern is
+  // verifying that the prompt-rendering helper filters terminal items.
+  // We approximate this by inspecting the persisted checklist directly:
+  // the only item is in "satisfied" status, so the open-set is empty.
+  const openAfter = (after.evidence_checklist ?? []).filter(
+    (entry) => (entry.status ?? "open") === "open",
+  );
+  assert.equal(openAfter.length, 0, "no open items remain after operator marks satisfied");
+  // Also verify "addressed" is rejected as an operator-set value at the
+  // type-system level: the mutator's signature excludes "addressed". We
+  // assert that calling setEvidenceChecklistItemStatus with "deferred"
+  // works as a different terminal transition.
+  const result2 = opOrch.store.setEvidenceChecklistItemStatus(
+    opRound1.session.session_id,
+    item.id,
+    "deferred",
+    { note: "retract satisfied, defer instead", by: "operator" },
+  );
+  assert.equal(result2.item.status, "deferred");
+  assert.equal(result2.history_entry.from, "satisfied");
+  assert.equal(result2.history_entry.to, "deferred");
+  console.log("[smoke] evidence_checklist_operator_status_update_test: PASS");
+}
+
+// v2.8.0 Per-Peer Health Metrics: store.metrics() returns a per_peer_health
+// breakdown with READY count, NEEDS_EVIDENCE count, ready_rate,
+// parser_warnings_total, and rejection counts grouped by failure_class.
+{
+  const phConfig = {
+    ...loadConfig(),
+    data_dir: path.join(os.tmpdir(), `cross-review-v2-peer-health-${Date.now()}`),
+    budget: {
+      ...loadConfig().budget,
+      max_session_cost_usd: 10000,
+      preflight_max_round_cost_usd: 10000,
+      until_stopped_max_cost_usd: 10000,
+    },
+  };
+  const phOrch = new CrossReviewOrchestrator(phConfig, () => {});
+  // Two single-peer rounds against separate sessions so the prompt-driven
+  // FORCE_NEEDS_EVIDENCE stub branch distinguishes the peers cleanly.
+  // The stub adapter uses prompt-content matching (not peer identity)
+  // for status decisions, so a mixed [claude+codex] round with the same
+  // prompt would yield identical statuses for both peers.
+  await phOrch.askPeers({
+    task: "Per-peer health smoke: claude NEEDS_EVIDENCE round.",
+    draft: "FORCE_NEEDS_EVIDENCE",
+    caller: "operator",
+    peers: ["claude"],
+  });
+  await phOrch.askPeers({
+    task: "Per-peer health smoke: codex READY round.",
+    draft: "Clean draft, no force marker — codex stub returns READY by default.",
+    caller: "operator",
+    peers: ["codex"],
+  });
+  const metrics = phOrch.store.metrics();
+  const perPeer = metrics.per_peer_health;
+  assert.ok(perPeer, "metrics must include per_peer_health");
+  const claudeHealth = perPeer.claude;
+  const codexHealth = perPeer.codex;
+  assert.ok(claudeHealth, "claude must appear in per_peer_health");
+  assert.ok(codexHealth, "codex must appear in per_peer_health");
+  assert.equal(claudeHealth.results_total, 1);
+  assert.equal(claudeHealth.needs_evidence_count, 1);
+  assert.equal(claudeHealth.ready_count, 0);
+  assert.equal(claudeHealth.ready_rate, 0);
+  assert.equal(claudeHealth.needs_evidence_rate, 1);
+  assert.equal(codexHealth.results_total, 1);
+  assert.equal(codexHealth.ready_count, 1);
+  assert.equal(codexHealth.needs_evidence_count, 0);
+  assert.equal(codexHealth.ready_rate, 1);
+  // Stub adapter zero-cost (v2.5.0): avg/total cost must be null because
+  // no result carried a non-stub cost source.
+  assert.equal(claudeHealth.avg_cost_usd, null);
+  assert.equal(codexHealth.total_cost_usd, null);
+  assert.equal(claudeHealth.rejected_total, 0);
+  assert.equal(codexHealth.rejected_total, 0);
+  console.log("[smoke] per_peer_health_metrics_test: PASS");
+}
+
 // v2.6.1 NOTE: smoke coverage for `peer.fallback.budget_blocked` and
 // `peer.moderation_recovery.budget_blocked` is intentionally NOT
 // included. These two gates use the same arithmetic shape as preflight

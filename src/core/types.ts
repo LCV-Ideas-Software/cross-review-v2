@@ -170,6 +170,18 @@ export interface EvidenceAttachment {
 // Empirical driver: the 253-session corpus showed 200+ NEEDS_EVIDENCE
 // blockers across peers, and many sessions repeated the same ask
 // across multiple rounds without explicit acknowledgement.
+//
+// v2.8.0 lifecycle: items default to "open" and the runtime promotes
+// them to "addressed" when a subsequent round goes by without the
+// peer resurfacing the same ask (resurfacing-inference). The operator
+// can move items to terminal states via session_evidence_checklist_update.
+// Conflict rule: when a peer resurfaces an "addressed" item it reverts
+// to "open" — the peer's NEEDS_EVIDENCE wins over the runtime's
+// inference. Terminal operator statuses are NOT auto-reverted; the
+// runtime emits a peer_resurfaced_terminal event so the operator
+// notices peers still asking for something they explicitly closed.
+export type EvidenceChecklistStatus = "open" | "addressed" | "satisfied" | "deferred" | "rejected";
+
 export interface EvidenceChecklistItem {
   // Stable id derived from sha256(`${peer}:${ask}`); identical asks
   // from the same peer are deduplicated across rounds.
@@ -189,6 +201,26 @@ export interface EvidenceChecklistItem {
   first_seen_at: string;
   // ISO timestamp of latest surfacing.
   last_seen_at: string;
+  // v2.8.0 lifecycle status. Items without `status` are treated as
+  // "open" for back-compat with sessions saved by v2.7.x.
+  status?: EvidenceChecklistStatus;
+  // v2.8.0: round in which the runtime auto-promoted the item to
+  // "addressed". Cleared when the item reverts to "open".
+  addressed_at_round?: number;
+}
+
+// v2.8.0: durable audit trail for every status transition on an
+// evidence checklist item. The runtime appends an entry on every
+// auto-transition (resurfacing inference) and on every operator
+// call to session_evidence_checklist_update.
+export interface EvidenceStatusHistoryEntry {
+  ts: string;
+  item_id: string;
+  from: EvidenceChecklistStatus;
+  to: EvidenceChecklistStatus;
+  by: "runtime" | "operator";
+  round?: number;
+  note?: string;
 }
 
 export interface GenerationArtifact {
@@ -293,6 +325,9 @@ export interface SessionMeta {
   failed_attempts?: Array<PeerFailure & { round: number }>;
   evidence_files?: EvidenceAttachment[];
   evidence_checklist?: EvidenceChecklistItem[];
+  // v2.8.0: durable audit trail for every status transition on an
+  // evidence checklist item (auto + operator). Newest entries appended.
+  evidence_status_history?: EvidenceStatusHistoryEntry[];
   generation_files?: GenerationArtifact[];
   operator_escalations?: OperatorEscalation[];
   control?: SessionControl;
@@ -372,6 +407,30 @@ export interface AppConfig {
   cost_rates: Partial<Record<PeerId, { input_per_million: number; output_per_million: number }>>;
 }
 
+// v2.8.0: per-peer health roll-up surfaced through the runtime metrics
+// payload and the dashboard. Closes Codex+Gemini audit item "per-provider
+// health dashboard" — operators can see at a glance which provider drives
+// most of the cost or stalls most of the convergence rounds.
+export interface PeerHealthSummary {
+  peer: PeerId;
+  results_total: number;
+  ready_count: number;
+  not_ready_count: number;
+  needs_evidence_count: number;
+  // Results where the peer produced a response but no parseable status
+  // (parser fell back to `null`). Distinct from `rejected_total`, which
+  // counts requests that never produced a usable response at all.
+  unresolved_count: number;
+  ready_rate: number;
+  needs_evidence_rate: number;
+  // null when no result carried a populated total_cost.
+  avg_cost_usd: number | null;
+  total_cost_usd: number | null;
+  parser_warnings_total: number;
+  rejected_total: number;
+  failures_by_class: Partial<Record<PeerFailure["failure_class"], number>>;
+}
+
 export interface RuntimeMetrics {
   generated_at: string;
   scope: "all" | "session";
@@ -395,4 +454,6 @@ export interface RuntimeMetrics {
     peer_average: number | null;
     generation_average: number | null;
   };
+  // v2.8.0
+  per_peer_health: Partial<Record<PeerId, PeerHealthSummary>>;
 }

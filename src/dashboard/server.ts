@@ -85,7 +85,12 @@ function html(): string {
     .timeline { background: white; color: #102033; border: 1px solid #d8e1ee; }
     .event { border-left: 3px solid #1f6feb; padding: 8px 0 8px 10px; margin: 0 0 8px; }
     .event small { color: #52647b; display: block; }
-    @media (max-width: 820px) { main { padding: 20px; } header, .detail-grid { display: block; } .badge { display: inline-block; margin-top: 10px; } }
+    table.peer-health { width: 100%; border-collapse: collapse; font-size: 14px; }
+    table.peer-health th, table.peer-health td { border-bottom: 1px solid #e5ecf5; padding: 8px 10px; text-align: left; }
+    table.peer-health th { font-weight: 700; color: #52647b; background: #f6f8fb; }
+    table.peer-health td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    table.peer-health td.peer { font-weight: 700; }
+    @media (max-width: 820px) { main { padding: 20px; } header, .detail-grid { display: block; } .badge { display: inline-block; margin-top: 10px; } table.peer-health { font-size: 12px; } }
   </style>
 </head>
 <body>
@@ -102,6 +107,11 @@ function html(): string {
       <article class="card metric"><span>Convergidas</span><strong>...</strong></article>
       <article class="card metric"><span>Rodadas</span><strong>...</strong></article>
       <article class="card metric"><span>Custo</span><strong>...</strong></article>
+    </section>
+    <section class="card" id="peer-health" style="margin-top:14px">
+      <h2>Saúde por provider</h2>
+      <div class="muted" style="margin-bottom:8px">READY rate, NEEDS_EVIDENCE rate, custo médio e parser warnings por peer (todas as sessões salvas).</div>
+      <div id="peer-health-body" class="muted">Carregando...</div>
     </section>
     <section class="grid" style="margin-top:14px">
       <article class="card"><strong>Dados</strong><p class="muted">${config.data_dir}</p></article>
@@ -136,6 +146,33 @@ function html(): string {
     function stateOf(session) {
       return session.outcome || session.convergence_health?.state || 'em andamento';
     }
+    function pct(value) {
+      if (value == null || !Number.isFinite(value)) return '—';
+      return (value * 100).toFixed(1) + '%';
+    }
+    function renderPeerHealth(perPeer) {
+      const peers = Object.values(perPeer || {}).filter(Boolean).sort((a, b) => b.results_total - a.results_total);
+      if (!peers.length) return '<div class="muted">Nenhum resultado de peer registrado ainda.</div>';
+      const head = '<thead><tr>' +
+        ['Peer','Resultados','READY','NEEDS_EVIDENCE','NOT_READY','READY rate','NE rate','Custo total','Custo médio','Parser warns','Rejections']
+          .map(h => '<th>' + h + '</th>').join('') + '</tr></thead>';
+      const body = '<tbody>' + peers.map(p =>
+        '<tr>' +
+        '<td class="peer">' + escapeHtml(p.peer) + '</td>' +
+        '<td class="num">' + p.results_total + '</td>' +
+        '<td class="num">' + p.ready_count + '</td>' +
+        '<td class="num">' + p.needs_evidence_count + '</td>' +
+        '<td class="num">' + p.not_ready_count + '</td>' +
+        '<td class="num">' + pct(p.ready_rate) + '</td>' +
+        '<td class="num">' + pct(p.needs_evidence_rate) + '</td>' +
+        '<td class="num">' + (p.total_cost_usd == null ? '—' : '$' + p.total_cost_usd.toFixed(4)) + '</td>' +
+        '<td class="num">' + (p.avg_cost_usd == null ? '—' : '$' + p.avg_cost_usd.toFixed(6)) + '</td>' +
+        '<td class="num">' + p.parser_warnings_total + '</td>' +
+        '<td class="num">' + p.rejected_total + '</td>' +
+        '</tr>'
+      ).join('') + '</tbody>';
+      return '<table class="peer-health">' + head + body + '</table>';
+    }
     async function refreshMetrics() {
       const metrics = await fetch('/api/metrics').then(r => r.json());
       document.getElementById('metrics').innerHTML = [
@@ -144,6 +181,7 @@ function html(): string {
         ['Rodadas', metrics.rounds],
         ['Custo', money(metrics.total_cost.total_cost)],
       ].map(([label, value]) => \`<article class="card metric"><span>\${label}</span><strong>\${value}</strong></article>\`).join('');
+      document.getElementById('peer-health-body').innerHTML = renderPeerHealth(metrics.per_peer_health);
     }
     async function refresh() {
       await refreshMetrics();

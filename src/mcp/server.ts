@@ -208,6 +208,7 @@ const TOOL_NAMES = [
   "session_report",
   "session_check_convergence",
   "session_attach_evidence",
+  "session_evidence_checklist_update",
   "escalate_to_operator",
   "session_sweep",
   "session_finalize",
@@ -821,6 +822,42 @@ export async function main(): Promise<void> {
           content,
           content_type,
           extension,
+        }),
+        response_format,
+      ),
+  );
+
+  server.registerTool(
+    "session_evidence_checklist_update",
+    {
+      title: "Update Evidence Checklist Item Status",
+      description:
+        "Operator workflow for the v2.7.0 Evidence Broker. Mark a checklist item as 'satisfied' (operator confirms the ask was answered), 'deferred' (out of scope for this session), 'rejected' (ask itself is unfounded), or 'open' (retract a prior terminal status). The 'addressed' status is reserved for runtime auto-promotion (resurfacing inference) and cannot be set via this tool. Every transition is appended to evidence_status_history with the operator's optional note.",
+      inputSchema: z
+        .object({
+          session_id: SessionIdSchema,
+          item_id: z
+            .string()
+            .min(1)
+            .max(64)
+            .regex(/^[a-f0-9]+$/i, "item_id must be a hex string"),
+          status: z.enum(["open", "satisfied", "deferred", "rejected"]),
+          note: z.string().min(1).max(2000).optional(),
+          response_format: ResponseFormatSchema,
+        })
+        .strict(),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ session_id, item_id, status, note, response_format }) =>
+      textResult(
+        runtime.orchestrator.store.setEvidenceChecklistItemStatus(session_id, item_id, status, {
+          note,
+          by: "operator",
         }),
         response_format,
       ),

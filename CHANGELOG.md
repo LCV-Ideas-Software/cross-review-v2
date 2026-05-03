@@ -9,6 +9,49 @@ standard `v00.00.00`; npm package versions remain SemVer.
 
 _No entries yet._
 
+## [v02.08.00] - 2026-05-03
+
+**Per-provider health dashboard + Evidence Broker lifecycle (Codex+Gemini audit, last architectural item).** Bundles three independent features that all extend v2.7.0's Evidence Broker plus the per-provider rollup that closes the original audit list. (a) Per-peer health metrics expose READY rate, NEEDS_EVIDENCE rate, total/avg cost, parser warnings, and rejected_total grouped by `failure_class`, surfaced in `RuntimeMetrics.per_peer_health` and rendered as a sortable table in the dashboard. (b) Address detection auto-promotes `EvidenceChecklistItem` from `open` to `addressed` via resurfacing-inference: if a peer that asked for evidence in round N does not bring the same ask back in round N+1, the runtime concludes the ask was satisfied and emits a `session.evidence_checklist_addressed` event. The conflict rule when a peer brings an addressed item back is documented and exercised by smoke. (c) New MCP tool `session_evidence_checklist_update` lets the operator move items to terminal statuses (`satisfied`, `deferred`, `rejected`) or back to `open` with an optional note; every transition appends an entry to a durable `evidence_status_history` audit trail.
+
+### Added
+
+- **`PeerHealthSummary` interface** in `core/types.ts` — `peer`, `results_total`, `ready_count`, `not_ready_count`, `needs_evidence_count`, `unresolved_count`, `ready_rate`, `needs_evidence_rate`, `avg_cost_usd`, `total_cost_usd`, `parser_warnings_total`, `rejected_total`, `failures_by_class`. `RuntimeMetrics.per_peer_health` carries the rollup keyed by `PeerId`.
+- **`SessionStore.metrics()` per-peer rollup.** Single pass over all rounds accumulates per-peer counts, costs (excluding `source: "stub"` entries to avoid skewing FinOps numbers with synthetic test runs), parser warnings, and rejection counts grouped by `failure_class`. Computed rates are clamped to 0 when `results_total === 0`.
+- **`EvidenceChecklistStatus` type union** — `"open" | "addressed" | "satisfied" | "deferred" | "rejected"`. Items without `status` are treated as `"open"` for back-compat with sessions saved by v2.7.x.
+- **`EvidenceStatusHistoryEntry` interface** + `SessionMeta.evidence_status_history` — durable audit trail. Each entry: `ts`, `item_id`, `from`, `to`, `by: "runtime" | "operator"`, optional `round`, optional `note`. Newest-appended ordering.
+- **`SessionStore.runEvidenceChecklistAddressDetection(sessionId, currentRound)`** — atomic resurfacing-inference pass under the session lock. Open items whose `last_round < currentRound` are promoted to `addressed` and stamped with `addressed_at_round`. Items already `addressed` whose `last_round === currentRound` (i.e. aggregation just bumped them) revert to `open` and clear `addressed_at_round`. Terminal operator statuses are NEVER auto-changed; the method returns a `peer_resurfaced_terminal` collection so the orchestrator can emit a visibility event.
+- **`SessionStore.setEvidenceChecklistItemStatus(sessionId, itemId, status, options)`** — operator workflow mutator. `status` parameter type excludes `"addressed"` to enforce the rule that runtime alone owns auto-promotion. Appends a history entry every time, even on no-op calls, so the audit captures explicit operator intent.
+- **`session_evidence_checklist_update` MCP tool.** Inputs: `session_id` (UUIDv4), `item_id` (16-hex sha256 prefix), `status` (`"open" | "satisfied" | "deferred" | "rejected"`), optional `note`. Returns the mutated item + appended history entry.
+- **Three new orchestrator events**:
+  - `session.evidence_checklist_addressed` — fires when at least one item was auto-promoted to addressed in the current round; data carries `ids` + `count`.
+  - `session.evidence_checklist_reopened` — fires when at least one previously-addressed item reverted to open because the peer resurfaced it; data carries `ids` + `count`.
+  - `session.evidence_checklist_peer_resurfaced_terminal` — fires when a peer brought back an item that the operator had explicitly closed (status preserved); data carries `items: [{id, peer, status}]`.
+- **Dashboard "Saúde por provider" card.** Sortable table rendering `per_peer_health` with `Resultados`, `READY`, `NEEDS_EVIDENCE`, `NOT_READY`, `READY rate`, `NE rate`, `Custo total`, `Custo médio`, `Parser warns`, `Rejections`. Sorted by `results_total` descending so the most-active peer appears first. Refreshes alongside the existing metrics card.
+- **`SessionStore.TERMINAL_STATUSES` static readonly Set** — the runtime checks `TERMINAL_STATUSES.has(status)` instead of an `||` chain to avoid any future refactor accidentally writing the buggy `(status === "satisfied" || "deferred" || "rejected")` truthy-OR form (always-truthy because non-empty strings are truthy in JS/TS). Codex+deepseek surfaced this regression risk during the R1 of the v2.8.0 trilateral; the explicit Set membership is type-safe and idiomatic.
+- **Four new smoke markers**:
+  - `evidence_checklist_terminal_preservation_test` — locks in the rule that `runEvidenceChecklistAddressDetection` NEVER auto-mutates terminal items and that an open item resurfaced in the current round is not misclassified under `peer_resurfaced_terminal`. 5-item fixture with one of each status (open/satisfied/deferred/rejected/addressed) all at `last_round === currentRound`. Asserts: open stays open (no auto-promote, no terminal misclassification), terminals all reported and preserved on disk, addressed reverts to open, addressed/reopened sets exclude terminal ids.
+  - `evidence_checklist_address_detection_test` — R1 with `FORCE_NEEDS_EVIDENCE` produces 1 open item; R2 with a clean draft (no marker) auto-promotes it to addressed, populates `addressed_at_round`, appends a runtime history entry, and emits `session.evidence_checklist_addressed`.
+  - `evidence_checklist_operator_status_update_test` — `setEvidenceChecklistItemStatus(itemId, "satisfied", {note})` mutates status, appends operator-attributed history, persists across `store.read()`, leaves the open-set empty. A second call to `"deferred"` confirms `from` correctly reflects the prior `"satisfied"` state.
+  - `per_peer_health_metrics_test` — mixed askPeers round (claude FORCE_NEEDS_EVIDENCE + codex default READY) yields `per_peer_health[claude].ready_rate === 0`, `[codex].ready_rate === 1`, both peers' `avg_cost_usd === null` (stub zero-cost excluded from FinOps totals), `rejected_total === 0`.
+
+### Behavioral change (operator-visible)
+
+- The "Outstanding Evidence Asks" prompt block now filters to items in `open` status only. Items auto-marked `addressed` or operator-closed (`satisfied`/`deferred`/`rejected`) are omitted from the prompt so peers focus on what is still outstanding. The dashboard and `session_read` continue to surface the full checklist with status badges.
+- Sessions running through `runUntilUnanimous` will see fewer recurring asks per round once R1's items have been satisfied and the inference promotes them. Sessions where peers cycle through the same blocker repeatedly will see the `[seen N rounds]` tag continue to escalate (round_count keeps incrementing even while status flips back to open).
+- Operators can now mark items as `deferred` (out of scope for this session) or `rejected` (ask itself unfounded) without losing the audit trail. The peer-resurfaced-terminal event surfaces when a peer keeps demanding something the operator explicitly closed — useful for noticing peer/operator disagreement without acting on it automatically.
+
+### Validation
+
+- **`npm run typecheck`** clean.
+- **`npm run format:check`** clean.
+- **`npm run lint`** clean.
+- **`npm run smoke`** EXIT=0 with 22 PASS markers (18 carry-over from v2.7.0 + 4 new: `evidence_checklist_terminal_preservation_test`, `evidence_checklist_address_detection_test`, `evidence_checklist_operator_status_update_test`, `per_peer_health_metrics_test`).
+- **Cross-review-v2 trilateral session `41237780-4639-4c9d-8b56-902ea6e36267`** caller=claude, peers=codex+gemini+deepseek, 2 rounds, ~$0.55 USD. **Outcome: converged unanimous_ready** (all 4 parties READY in R2). R1: codex+deepseek caught a suspicious truthy-OR predicate shorthand in the inline excerpt I sent (`(status==="satisfied"||"deferred"||"rejected")` would have been always-truthy); gemini READY R1. The actual production code already used the correct explicit form, but the trilateral correctly flagged the regression risk. R2: applied a defensive refactor to `SessionStore.TERMINAL_STATUSES.has(status)` Set membership + added the `evidence_checklist_terminal_preservation_test` regression smoke marker. Trilateral converged unanimous READY. (An earlier session `092356b9-6974-40ee-b0fa-d6faf6ab7826` ran 7 rounds and aborted with `lead_peer_meta_review_drift_pivoting_to_initial_draft` because `run_until_unanimous` had the lead generate a meta-review instead of substantive content; the fix was to provide the evidence package directly via `initial_draft`.)
+
+### Deferred to v2.9+
+
+- LLM-based "satisfied" detection (uses peer judgment of the new draft against open asks) is a candidate for v2.9 if the heuristic resurfacing-inference proves insufficient in practice. The architectural backlog from the original Codex+Gemini audit is closed with this release.
+
 ## [v02.07.00] - 2026-05-03
 
 **Evidence Broker (Codex+Gemini audit item #1).** Empirical analysis of 253 historical sessions surfaced 200+ NEEDS_EVIDENCE blockers across peers, with many sessions repeating the same `caller_request` across multiple rounds without explicit acknowledgement. v2.7.0 adds a per-session "evidence checklist" that aggregates every NEEDS_EVIDENCE peer's `caller_requests` into a deduplicated, persistent list. Each subsequent revision prompt now surfaces the running checklist as a "Outstanding Evidence Asks" block, so the caller can no longer drift past unaddressed asks unintentionally.

@@ -245,16 +245,24 @@ function buildReviewPrompt(
 // as a prompt-friendly block. Items repeated across rounds get a
 // "[seen N rounds]" tag so the caller knows the ask is sticky.
 // Each item shows the originating peer + the verbatim ask.
+//
+// v2.8.0: only items in `open` status (or status undefined for legacy
+// pre-v2.8 sessions) appear in the prompt. Items auto-promoted to
+// `addressed` by resurfacing inference, or moved to terminal states
+// (`satisfied`, `deferred`, `rejected`) by the operator, are suppressed
+// here so peers focus on what is still outstanding. The dashboard and
+// session_read still surface the full checklist with status badges.
 function evidenceChecklistBlock(meta: SessionMeta): string[] {
   const checklist = meta.evidence_checklist ?? [];
-  if (!checklist.length) return [];
+  const open = checklist.filter((item) => (item.status ?? "open") === "open");
+  if (!open.length) return [];
   const lines = [
     "## Outstanding Evidence Asks (running checklist across all rounds)",
     "Each line below is a `caller_request` returned by a peer in NEEDS_EVIDENCE state.",
     "Address every outstanding ask in the revised version below — concrete file:line references, grep output, diff hunks, MD5 hashes, log lines. R1 NEEDS_EVIDENCE indicates missing upfront evidence in the original draft (a draft defect per session-start contract rule #1); any same ask resurfacing in R2+ is additionally a revision defect.",
     "",
   ];
-  for (const item of checklist) {
+  for (const item of open) {
     const persistence = item.round_count > 1 ? ` [seen ${item.round_count} rounds]` : "";
     lines.push(`- **${item.peer}** (R${item.first_round}${persistence}): ${item.ask}`);
   }
@@ -1372,6 +1380,61 @@ export class CrossReviewOrchestrator {
         message: `Evidence checklist now has ${checklist.length} item(s) across ${new Set(checklist.map((c) => c.peer)).size} peer(s).`,
         data: { items_total: checklist.length },
       });
+    }
+    // v2.8.0 Address Detection: run resurfacing-inference after the
+    // aggregation. Open items whose last_round did not advance to the
+    // current round are auto-promoted to "addressed"; previously-addressed
+    // items resurfaced this round revert to "open"; terminal operator
+    // statuses surface a `peer_resurfaced_terminal` event for visibility
+    // but the status itself is not auto-changed (operator-owned).
+    // Always runs, even when evidenceAsks is empty: a round with zero
+    // NEEDS_EVIDENCE means EVERY prior open item needs to be promoted
+    // to addressed. Skipping the call when evidenceAsks is empty would
+    // miss exactly the case the inference is designed for.
+    if ((this.store.read(session.session_id).evidence_checklist ?? []).length > 0) {
+      const addressDetection = this.store.runEvidenceChecklistAddressDetection(
+        session.session_id,
+        round.round,
+      );
+      if (addressDetection.addressed.length > 0) {
+        this.emit({
+          type: "session.evidence_checklist_addressed",
+          session_id: session.session_id,
+          round: round.round,
+          message: `${addressDetection.addressed.length} ask(s) auto-marked addressed (peer did not resurface in round ${round.round}).`,
+          data: {
+            ids: addressDetection.addressed.map((item) => item.id),
+            count: addressDetection.addressed.length,
+          },
+        });
+      }
+      if (addressDetection.reopened.length > 0) {
+        this.emit({
+          type: "session.evidence_checklist_reopened",
+          session_id: session.session_id,
+          round: round.round,
+          message: `${addressDetection.reopened.length} ask(s) reverted to open (peer resurfaced in round ${round.round}).`,
+          data: {
+            ids: addressDetection.reopened.map((item) => item.id),
+            count: addressDetection.reopened.length,
+          },
+        });
+      }
+      if (addressDetection.peer_resurfaced_terminal.length > 0) {
+        this.emit({
+          type: "session.evidence_checklist_peer_resurfaced_terminal",
+          session_id: session.session_id,
+          round: round.round,
+          message: `${addressDetection.peer_resurfaced_terminal.length} ask(s) resurfaced by peer despite operator-terminal status (status preserved).`,
+          data: {
+            items: addressDetection.peer_resurfaced_terminal.map((item) => ({
+              id: item.id,
+              peer: item.peer,
+              status: item.status,
+            })),
+          },
+        });
+      }
     }
     let updated = this.store.read(session.session_id);
     if (convergence.converged) {

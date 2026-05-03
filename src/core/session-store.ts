@@ -5,9 +5,13 @@ import type {
   AppConfig,
   ConvergenceResult,
   ConvergenceScope,
+  EvidenceChecklistItem,
+  EvidenceChecklistStatus,
+  EvidenceStatusHistoryEntry,
   GenerationResult,
   GenerationArtifact,
   PeerFailure,
+  PeerHealthSummary,
   PeerId,
   PeerProbeResult,
   PeerResult,
@@ -663,6 +667,144 @@ export class SessionStore {
     });
   }
 
+  // v2.8.0: terminal statuses owned by the operator. The runtime never
+  // auto-mutates items in these states — it only surfaces them via the
+  // peer_resurfaced_terminal collection so the orchestrator can emit a
+  // visibility event. Held as a Set because the runtime checks membership
+  // on every item every round; a Set lookup avoids any risk of someone
+  // later writing the buggy `(status === "satisfied" || "deferred" ||
+  // "rejected")` truthy-OR form by accident.
+  static readonly TERMINAL_STATUSES: ReadonlySet<EvidenceChecklistStatus> =
+    new Set<EvidenceChecklistStatus>(["satisfied", "deferred", "rejected"]);
+
+  // v2.8.0: resurfacing-inference for the evidence checklist. Runs AFTER
+  // appendEvidenceChecklistItems for a given round and applies two rules
+  // atomically under the session lock:
+  //   1. Items in `open` whose `last_round < currentRound` were not
+  //      brought back by any peer this round → promote to `addressed`
+  //      and stamp `addressed_at_round`.
+  //   2. Items in `addressed` whose `last_round === currentRound` were
+  //      resurfaced this round (aggregation already bumped last_round
+  //      and round_count) → revert to `open` and clear addressed_at_round.
+  // Terminal operator statuses (satisfied/deferred/rejected) are NEVER
+  // touched here. The peer_resurfaced_terminal information is surfaced
+  // by the orchestrator via a separate event so operators see when peers
+  // keep asking for items they explicitly closed; the status itself is
+  // operator-owned.
+  runEvidenceChecklistAddressDetection(
+    sessionId: string,
+    currentRound: number,
+  ): {
+    addressed: EvidenceChecklistItem[];
+    reopened: EvidenceChecklistItem[];
+    peer_resurfaced_terminal: EvidenceChecklistItem[];
+  } {
+    return this.withSessionLock(sessionId, () => {
+      const meta = this.read(sessionId);
+      const checklist = meta.evidence_checklist ?? [];
+      if (!checklist.length) {
+        return { addressed: [], reopened: [], peer_resurfaced_terminal: [] };
+      }
+      const addressed: EvidenceChecklistItem[] = [];
+      const reopened: EvidenceChecklistItem[] = [];
+      const peerResurfacedTerminal: EvidenceChecklistItem[] = [];
+      const history = meta.evidence_status_history ?? [];
+      const ts = now();
+      for (const item of checklist) {
+        const status: EvidenceChecklistStatus = item.status ?? "open";
+        if (status === "open" && item.last_round < currentRound) {
+          item.status = "addressed";
+          item.addressed_at_round = currentRound;
+          addressed.push(item);
+          history.push({
+            ts,
+            item_id: item.id,
+            from: "open",
+            to: "addressed",
+            by: "runtime",
+            round: currentRound,
+            note: `auto: peer did not resurface ask in round ${currentRound}`,
+          });
+        } else if (status === "addressed" && item.last_round === currentRound) {
+          item.status = "open";
+          delete item.addressed_at_round;
+          reopened.push(item);
+          history.push({
+            ts,
+            item_id: item.id,
+            from: "addressed",
+            to: "open",
+            by: "runtime",
+            round: currentRound,
+            note: `auto: peer resurfaced ask in round ${currentRound}`,
+          });
+        } else if (SessionStore.TERMINAL_STATUSES.has(status) && item.last_round === currentRound) {
+          // Operator closed it but the peer brought it back this round.
+          // Status stays terminal (operator-owned); we surface it for
+          // the orchestrator to emit a visibility event.
+          peerResurfacedTerminal.push(item);
+        }
+      }
+      if (addressed.length || reopened.length) {
+        meta.evidence_status_history = history;
+        meta.updated_at = ts;
+        writeJson(this.metaPath(sessionId), meta);
+      }
+      return { addressed, reopened, peer_resurfaced_terminal: peerResurfacedTerminal };
+    });
+  }
+
+  // v2.8.0: operator workflow mutator for the evidence checklist. Used by
+  // the session_evidence_checklist_update MCP tool. Allowed transitions
+  // (operator): open → satisfied | deferred | rejected | open;
+  // addressed → satisfied | deferred | rejected | open. Terminal-state
+  // items can also be moved BACK to "open" by the operator (retract a
+  // deferral/rejection); that re-arms the runtime auto-promotion logic.
+  // Operator CANNOT move items to "addressed" — that status is
+  // runtime-managed (resurfacing inference). Returns the mutated item
+  // and the appended history entry.
+  setEvidenceChecklistItemStatus(
+    sessionId: string,
+    itemId: string,
+    status: Exclude<EvidenceChecklistStatus, "addressed">,
+    options: { note?: string; by?: "operator" | "runtime" } = {},
+  ): { item: EvidenceChecklistItem; history_entry: EvidenceStatusHistoryEntry } {
+    return this.withSessionLock(sessionId, () => {
+      const meta = this.read(sessionId);
+      const checklist = meta.evidence_checklist ?? [];
+      const item = checklist.find((entry) => entry.id === itemId);
+      if (!item) {
+        throw new Error(`evidence_checklist_item_not_found: ${itemId}`);
+      }
+      const from: EvidenceChecklistStatus = item.status ?? "open";
+      if (from === status) {
+        // No-op: already at the requested status. We still record a
+        // history entry so the audit trail captures the operator's
+        // explicit intent.
+      }
+      const ts = now();
+      const entry: EvidenceStatusHistoryEntry = {
+        ts,
+        item_id: itemId,
+        from,
+        to: status,
+        by: options.by ?? "operator",
+        note: options.note,
+      };
+      item.status = status;
+      // The signature excludes "addressed" so any operator-driven status
+      // change clears the runtime-managed `addressed_at_round` stamp.
+      delete item.addressed_at_round;
+      const history = meta.evidence_status_history ?? [];
+      history.push(entry);
+      meta.evidence_status_history = history;
+      meta.evidence_checklist = checklist;
+      meta.updated_at = ts;
+      writeJson(this.metaPath(sessionId), meta);
+      return { item, history_entry: entry };
+    });
+  }
+
   recoverInterruptedSessions(activeSessionIds = new Set<string>()): SessionMeta[] {
     const recovered: SessionMeta[] = [];
     for (const session of this.list()) {
@@ -703,6 +845,40 @@ export class SessionStore {
     const generationLatencies: number[] = [];
     let moderationRecoveries = 0;
     let fallbackEvents = 0;
+    // v2.8.0: per-peer health roll-up. Each accumulator tracks all the
+    // fields needed for PeerHealthSummary; rates are computed at the end.
+    type PeerAccumulator = {
+      results_total: number;
+      ready_count: number;
+      not_ready_count: number;
+      needs_evidence_count: number;
+      unresolved_count: number;
+      cost_sum: number;
+      cost_count: number;
+      parser_warnings_total: number;
+      rejected_total: number;
+      failures_by_class: Partial<Record<PeerFailure["failure_class"], number>>;
+    };
+    const perPeer: Partial<Record<PeerId, PeerAccumulator>> = {};
+    const accumulator = (peer: PeerId): PeerAccumulator => {
+      let entry = perPeer[peer];
+      if (!entry) {
+        entry = {
+          results_total: 0,
+          ready_count: 0,
+          not_ready_count: 0,
+          needs_evidence_count: 0,
+          unresolved_count: 0,
+          cost_sum: 0,
+          cost_count: 0,
+          parser_warnings_total: 0,
+          rejected_total: 0,
+          failures_by_class: {},
+        };
+        perPeer[peer] = entry;
+      }
+      return entry;
+    };
 
     for (const session of sessions) {
       fallbackEvents += session.fallback_events?.length ?? 0;
@@ -715,9 +891,28 @@ export class SessionStore {
           if (peer.parser_warnings.some((warning) => warning.includes("moderation_safe_retry"))) {
             moderationRecoveries += 1;
           }
+          const acc = accumulator(peer.peer);
+          acc.results_total += 1;
+          if (peer.status === "READY") acc.ready_count += 1;
+          else if (peer.status === "NOT_READY") acc.not_ready_count += 1;
+          else if (peer.status === "NEEDS_EVIDENCE") acc.needs_evidence_count += 1;
+          else acc.unresolved_count += 1;
+          if (
+            peer.cost?.total_cost != null &&
+            Number.isFinite(peer.cost.total_cost) &&
+            peer.cost.source !== "stub"
+          ) {
+            acc.cost_sum += peer.cost.total_cost;
+            acc.cost_count += 1;
+          }
+          acc.parser_warnings_total += peer.parser_warnings.length;
         }
         for (const failure of round.rejected) {
           peerFailures[failure.failure_class] = (peerFailures[failure.failure_class] ?? 0) + 1;
+          const acc = accumulator(failure.peer);
+          acc.rejected_total += 1;
+          acc.failures_by_class[failure.failure_class] =
+            (acc.failures_by_class[failure.failure_class] ?? 0) + 1;
         }
       }
       for (const generation of session.generation_files ?? []) {
@@ -729,6 +924,26 @@ export class SessionStore {
 
     const average = (values: number[]): number | null =>
       values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
+
+    const perPeerHealth: Partial<Record<PeerId, PeerHealthSummary>> = {};
+    for (const [peer, acc] of Object.entries(perPeer) as Array<[PeerId, PeerAccumulator]>) {
+      const total = acc.results_total;
+      perPeerHealth[peer] = {
+        peer,
+        results_total: total,
+        ready_count: acc.ready_count,
+        not_ready_count: acc.not_ready_count,
+        needs_evidence_count: acc.needs_evidence_count,
+        unresolved_count: acc.unresolved_count,
+        ready_rate: total > 0 ? acc.ready_count / total : 0,
+        needs_evidence_rate: total > 0 ? acc.needs_evidence_count / total : 0,
+        avg_cost_usd: acc.cost_count > 0 ? acc.cost_sum / acc.cost_count : null,
+        total_cost_usd: acc.cost_count > 0 ? acc.cost_sum : null,
+        parser_warnings_total: acc.parser_warnings_total,
+        rejected_total: acc.rejected_total,
+        failures_by_class: acc.failures_by_class,
+      };
+    }
 
     return {
       generated_at: now(),
@@ -753,6 +968,7 @@ export class SessionStore {
         peer_average: average(peerLatencies),
         generation_average: average(generationLatencies),
       },
+      per_peer_health: perPeerHealth,
     };
   }
 
