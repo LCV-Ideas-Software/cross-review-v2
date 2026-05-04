@@ -33,8 +33,6 @@ import { classifyProviderError } from "./errors.js";
 import { withRetry } from "./retry.js";
 import { textFromOpenAIResponse, userPrompt } from "./text.js";
 
-type GrokReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
-
 type GrokUsage = {
   input_tokens?: number;
   output_tokens?: number;
@@ -66,6 +64,23 @@ function usageFromGrok(usage: GrokUsage | null | undefined): TokenUsage | undefi
     reasoning_tokens: usage.output_tokens_details?.reasoning_tokens,
   };
 }
+
+// v2.14.1 (operator directive 2026-05-04): per official xAI docs at
+// https://docs.x.ai/docs/guides/reasoning, only `grok-4.20-multi-agent`
+// accepts the `reasoning.effort` parameter. Other Grok-4 models
+// (grok-4.3, grok-4-1-fast, grok-4-latest aliased to those) reject it
+// with a 400. v2.14.0 initially used `grok-4-latest` and the request
+// included `reasoning.effort`, returning the rejection observed in the
+// ask_peers functional test of v2.14.0. v2.14.1 switches the default
+// model to `grok-4.20-multi-agent` so the reasoning channel works.
+//
+// Important semantic difference: on `grok-4.20-multi-agent`, the
+// `reasoning.effort` parameter controls **how many agents collaborate**
+// (low/medium/high/xhigh maps to 4 or 16 agents), NOT chain-of-thought
+// depth as on OpenAI/Anthropic. Operators tuning the field need this in
+// mind. Mapped through `grokEffort()` below — same OpenAI-style enum so
+// the v2.14.x config surface remains consistent across peers.
+type GrokReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
 function grokEffort(value: AppConfig["reasoning_effort"][PeerId]): GrokReasoningEffort {
   return value === "max" ? "xhigh" : (value ?? "xhigh");

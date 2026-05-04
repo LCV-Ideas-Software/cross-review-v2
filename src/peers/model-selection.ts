@@ -25,10 +25,12 @@ const PRIORITY: Record<PeerId, string[]> = {
   claude: ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"],
   gemini: ["gemini-3.1-pro-preview", "gemini-2.5-pro"],
   deepseek: ["deepseek-v4-pro", "deepseek-v4-flash"],
-  // v2.14.0: Grok priority list. `grok-4-latest` per operator
-  // directive (NOT grok-4.3 which docs landing page mentions); the
-  // alias resolves to the latest stable Grok 4 build.
-  grok: ["grok-4-latest", "grok-4", "grok-3-fast", "grok-3"],
+  // v2.14.1: Grok priority list reordered. `grok-4.20-multi-agent`
+  // promoted to head because it is the only Grok-4 model that accepts
+  // the `reasoning.effort` parameter (per xAI docs). Other Grok-4
+  // variants (4.3, 4-1-fast, 4-latest) follow but trigger a 400 when
+  // the body includes reasoning_effort — the adapter has to know.
+  grok: ["grok-4.20-multi-agent", "grok-4-latest", "grok-4", "grok-3-fast", "grok-3"],
 };
 
 function envOverrideName(peer: PeerId): string {

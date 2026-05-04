@@ -3576,7 +3576,13 @@ assert.equal(Object.hasOwn(metrics.decision_quality, "undefined"), false);
   assert.ok(PEERS.includes("grok"), "PEERS array must include 'grok'");
   assert.equal(PEERS.length, 5, "PEERS must have 5 entries (codex/claude/gemini/deepseek/grok)");
   const cfg = loadConfig();
-  assert.equal(cfg.models.grok, "grok-4-latest", "default grok model must be grok-4-latest");
+  // v2.14.1: default switched to grok-4.20-multi-agent (only Grok-4
+  // model that accepts reasoning.effort per official xAI docs).
+  assert.equal(
+    cfg.models.grok,
+    "grok-4.20-multi-agent",
+    "default grok model must be grok-4.20-multi-agent (v2.14.1 hotfix)",
+  );
   assert.ok("grok" in cfg.fallback_models, "fallback_models must have grok entry");
   assert.equal(cfg.peer_enabled.grok, true, "grok must be enabled by default");
   assert.ok(cfg.cost_rates.grok, "grok cost rates must be configured (env-set in smoke setup)");

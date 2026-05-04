@@ -9,6 +9,24 @@ standard `v00.00.00`; npm package versions remain SemVer.
 
 _No entries yet._
 
+## [v02.14.01] - 2026-05-04
+
+**Hotfix: Grok default model switched to `grok-4.20-multi-agent` so `reasoning.effort` works.** Functional verification of v2.14.0 against the real xAI API surfaced a 400: `Model grok-4-latest does not support parameter reasoningEffort`. Operator-directed re-check against official xAI docs at https://docs.x.ai/docs/guides/reasoning confirmed: only `grok-4.20-multi-agent` accepts the `reasoning.effort` parameter — all other Grok-4 models (`grok-4.3`, `grok-4-1-fast`, and the `grok-4-latest` alias that resolves to one of them) reject it with a 400. v2.14.0's default was `grok-4-latest`, hence the rejection.
+
+Operator directive (2026-05-04): switch to the highest-capability Grok model that accepts `reasoning.effort` rather than disabling the parameter. v2.14.1 makes that switch.
+
+### Changed
+
+- `AppConfig.models.grok` default: `grok-4-latest` → `grok-4.20-multi-agent` in `src/core/config.ts`.
+- `PRIORITY[grok]` reordered in `src/peers/model-selection.ts`: `grok-4.20-multi-agent` promoted to head, followed by the v2.14.0 entries (`grok-4-latest`, `grok-4`, `grok-3-fast`, `grok-3`) which trigger 400s when reasoning_effort is sent.
+- 6 MCP host configs (`.mcp.json`, `.vscode/mcp.json`, `.gemini/settings.json`, `.codex/config.toml`, `.gemini/antigravity/mcp_config.json`, `.grok/settings.json`) updated `CROSS_REVIEW_GROK_MODEL` to `grok-4.20-multi-agent`.
+- `peers/grok.ts` header doc updated to cite the docs verbatim and warn about the **semantic difference** of `reasoning.effort` on `grok-4.20-multi-agent` (it controls **agent count** — 4 or 16 — not chain-of-thought depth as on OpenAI/Anthropic).
+- Smoke marker `grok_integration_test` updated to assert default model = `grok-4.20-multi-agent`.
+
+### Why not just disable reasoning_effort?
+
+Initial reflex on the 400 was to drop the parameter from the GrokAdapter body. Operator pushback: "consultou docs?" — verification showed that disabling `reasoning_effort` would silently lose access to the only Grok feature that actually controls reasoning intensity (multi-agent collaboration count). Switching the model preserves the parameter's contract while fixing the rejection.
+
 ## [v02.14.00] - 2026-05-04
 
 **v2.14.0 ships the 7 deferred items + per-peer toggle + path-A structural fix as a single minor bump (operator scope re-framing 2026-05-04).** v2.13.0 shipped only the lead drift fix. v2.14.0 ships the rest of the 6 v2.13 backlog items (precision report, active-mode autowire, multi-peer consensus, contest_verdict, Grok integration) plus the operator-added per-peer on/off toggle and the path-A structural fix. Cross-review ship-trilaterals will use `run_until_unanimous` again now that drift fix is live.

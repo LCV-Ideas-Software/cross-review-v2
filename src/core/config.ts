@@ -18,7 +18,7 @@ function expandHome(rawPath: string): string {
   return rawPath;
 }
 
-export const VERSION = "2.14.0";
+export const VERSION = "2.14.1";
 export const RELEASE_DATE = "2026-05-04";
 export const DEFAULT_MAX_OUTPUT_TOKENS = 20_000;
 const COST_RATE_ENV_PREFIX: Record<PeerId, string> = {
@@ -188,8 +188,11 @@ export function loadConfig(): AppConfig {
       claude: envValue("CROSS_REVIEW_ANTHROPIC_MODEL") || "claude-opus-4-7",
       gemini: envValue("CROSS_REVIEW_GEMINI_MODEL") || "gemini-3.1-pro-preview",
       deepseek: envValue("CROSS_REVIEW_DEEPSEEK_MODEL") || "deepseek-v4-pro",
-      // v2.14.0: default grok-4-latest (operator-corrected, NOT grok-4.3).
-      grok: envValue("CROSS_REVIEW_GROK_MODEL") || "grok-4-latest",
+      // v2.14.1: default switched to `grok-4.20-multi-agent` (operator
+      // directive 2026-05-04). xAI docs: only this model accepts the
+      // `reasoning.effort` parameter; `grok-4-latest`/`grok-4.3`/
+      // `grok-4-1-fast` reject it with a 400. See peers/grok.ts header.
+      grok: envValue("CROSS_REVIEW_GROK_MODEL") || "grok-4.20-multi-agent",
     },
     fallback_models: {
       codex: listEnv("CROSS_REVIEW_OPENAI_FALLBACK_MODELS"),
