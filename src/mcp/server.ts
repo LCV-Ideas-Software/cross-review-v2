@@ -15,6 +15,20 @@ import { safeErrorMessage } from "../security/redact.js";
 
 const PeerSchema = z.enum(PEERS);
 const ResponseFormatSchema = z.enum(["json", "markdown"]).default("json");
+// v2.15.0 (item 2): per-call reasoning_effort overrides. Optional partial
+// record keyed by peer id; missing keys fall back to the global config
+// default (CROSS_REVIEW_<PEER>_REASONING_EFFORT env var, ultimately
+// resolved by core/config.ts). The string enum mirrors `ReasoningEffort`
+// in core/types.ts. Each adapter that consumes effort reads the override
+// from `PeerCallContext.reasoning_effort_override`. Adapters without an
+// effort knob (gemini today) silently ignore it.
+const ReasoningEffortSchema = z.enum(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const ReasoningEffortOverridesSchema = z
+  .record(PeerSchema, ReasoningEffortSchema)
+  .optional()
+  .describe(
+    "Optional per-peer reasoning_effort overrides for this call. Keys are peer ids (codex|claude|gemini|deepseek|grok); missing keys fall back to global config. Useful to dial down expensive peers (e.g. Grok grok-4.20-multi-agent xhigh = 16 agents) for routine reviews without editing the 6 MCP configs.",
+  );
 // v2.4.0 / audit closure (P1.2): UUIDv4 regex was already accepting
 // case-insensitive matches via the /i flag, but zod did not normalize the
 // output. On case-sensitive filesystems (Linux, macOS) the same logical
@@ -424,6 +438,7 @@ export async function main(): Promise<void> {
             .min(1)
             .max(5)
             .default([...PEERS] as PeerId[]),
+          reasoning_effort_overrides: ReasoningEffortOverridesSchema,
           response_format: ResponseFormatSchema,
         })
         .strict(),
@@ -457,6 +472,7 @@ export async function main(): Promise<void> {
             .min(1)
             .max(5)
             .default([...PEERS] as PeerId[]),
+          reasoning_effort_overrides: ReasoningEffortOverridesSchema,
           response_format: ResponseFormatSchema,
         })
         .strict(),
@@ -513,6 +529,7 @@ export async function main(): Promise<void> {
           max_rounds: z.number().int().min(1).max(1000).default(8),
           until_stopped: z.boolean().default(false),
           max_cost_usd: z.number().positive().optional(),
+          reasoning_effort_overrides: ReasoningEffortOverridesSchema,
           // v2.13.0: ship vs review intent. `ship` (default) — initial_draft
           // is the artifact under refinement; lead_peer produces a NEW
           // REVISED VERSION as prose. `review` — initial_draft is the
@@ -557,6 +574,7 @@ export async function main(): Promise<void> {
           max_rounds: z.number().int().min(1).max(1000).default(8),
           until_stopped: z.boolean().default(false),
           max_cost_usd: z.number().positive().optional(),
+          reasoning_effort_overrides: ReasoningEffortOverridesSchema,
           // v2.13.0: see run_until_unanimous for `mode` semantics.
           mode: z.enum(["ship", "review"]).default("ship"),
           response_format: ResponseFormatSchema,
@@ -1277,7 +1295,32 @@ export async function main(): Promise<void> {
       `[cross-review-v2] notice: judge auto-wire active in SHADOW mode via peer "${autowire.peer}" (max_items_per_pass=${autowire.max_items_per_pass}). Every askPeers round will fire a non-mutating judge pass; events session.evidence_judge_pass.shadow_decision are emitted per item.`,
     );
   });
+  // v2.15.0 (item 4A boot warning): when operator configured a
+  // CROSS_REVIEW_GROK_REASONING_EFFORT but the chosen model is NOT in
+  // the allowlist (only grok-4.20-multi-agent accepts the field per xAI
+  // docs), inform that the value will be ignored at the wire level.
+  // Catches misconfigurations early instead of letting the operator
+  // assume reasoning intensity is being applied when xAI silently
+  // ignores it (or when a future model would reject with 400).
+  setImmediate(() => {
+    if (!runtime.config.peer_enabled.grok) return;
+    const grokModel = runtime.config.models.grok;
+    const reasoningSetExplicitly = Boolean(process.env.CROSS_REVIEW_GROK_REASONING_EFFORT);
+    if (!reasoningSetExplicitly) return;
+    if (GROK_REASONING_EFFORT_MODELS_BOOT_NOTICE.has(grokModel)) return;
+    console.error(
+      `[cross-review-v2] notice: GrokAdapter — model="${grokModel}" does NOT accept reasoning.effort per xAI docs (only grok-4.20-multi-agent does). CROSS_REVIEW_GROK_REASONING_EFFORT="${process.env.CROSS_REVIEW_GROK_REASONING_EFFORT}" will be IGNORED at the wire level for this model. xAI auto-applies reasoning internally for the Grok-4 lineup. Set CROSS_REVIEW_GROK_MODEL=grok-4.20-multi-agent to enable agent-count control via reasoning.effort.`,
+    );
+  });
 }
+
+// v2.15.0: shadow copy of `peers/grok.ts:GROK_REASONING_EFFORT_MODELS`
+// for the boot notice. Avoids creating a hard import dependency from
+// the server boot path into a peer adapter module. If xAI adds models
+// to the reasoning-capable set, both lists must update together.
+const GROK_REASONING_EFFORT_MODELS_BOOT_NOTICE: ReadonlySet<string> = new Set([
+  "grok-4.20-multi-agent",
+]);
 
 // v2.4.0 / cross-review-v2 R6 follow-up (CI failure 25199679588): guard
 // main() so it only runs when this module is invoked as the entry point

@@ -9,6 +9,63 @@ standard `v00.00.00`; npm package versions remain SemVer.
 
 _No entries yet._
 
+## [v02.15.00] - 2026-05-04
+
+**v2.15.0 ships the 6 backlog items from `project_cross_review_v2_v215_backlog_candidates.md` as a single minor bump (operator directive 2026-05-04: "Quero TODOS implementados").** Driven by functional testing of v2.14.x against the real xAI API, which surfaced the `reasoning.effort` model-rejection that birthed the `feedback_consult_docs_before_amputating.md` HARD RULE. v2.15.0 codifies that rule at three levels: per-model capability allowlist (item 6), runtime 4xx docs-pointer (item 5), and operator-triggered per-call effort overrides (item 2) so dialing parameters down per-call is a first-class option rather than a config-edit detour.
+
+### Added — Item 1: consensus-based judge autowire
+
+New env var `CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_CONSENSUS_PEERS` (comma-separated peer ids). When set with ≥ 2 enabled peers, the orchestrator dispatches to `runEvidenceChecklistJudgeConsensusPass` instead of the single-peer judge — only items where ALL configured judges return `verified-satisfied` get promoted. Falls back to single-peer (`AUTOWIRE_PEER`) when consensus isn't configured. Either path emits the same shadow vs active mutation guarantees.
+
+- `AppConfig.evidence_judge_autowire.consensus_peers: PeerId[]` + `configured_consensus_peers_raw: string` (raw env value preserved for `server_info` debugging).
+- `active` flag flips on when single peer is set OR consensus has ≥ 2 enabled peers.
+- Orchestrator dispatch chooses consensus when `consensus_peers.filter(enabled).length >= 2`.
+- New smoke marker `consensus_autowire_config_parsed_test`.
+
+### Added — Item 2: per-call `reasoning_effort_overrides` MCP parameter
+
+New optional field on `ask_peers`, `session_start_round`, `run_until_unanimous`, and `session_start_unanimous`: `reasoning_effort_overrides: Partial<Record<PeerId, ReasoningEffort>>`. When supplied, each peer's adapter reads the override from `PeerCallContext.reasoning_effort_override` (falling back to `config.reasoning_effort[peer_id]`). Operator can dial down expensive peers (Grok `grok-4.20-multi-agent` xhigh = 16 agents) for routine reviews without editing the 6 MCP configs.
+
+- `PeerCallContext.reasoning_effort_override?: ReasoningEffort` (new field).
+- `AskPeersInput` and `RunUntilUnanimousInput` carry the optional map; orchestrator propagates per-peer values into the call context (`askPeers`, `runUntilUnanimous` lead generation + revision, `callPeerForReview` recovery path).
+- Wired into 4 adapters (codex/claude/grok/deepseek). Gemini has no effort knob today and silently ignores the override.
+- New zod `ReasoningEffortOverridesSchema = z.record(PeerSchema, ReasoningEffortSchema).optional()` on the 4 affected MCP tools.
+- New smoke marker `per_call_reasoning_effort_overrides_accepted_test`.
+
+### Added — Item 3: `runtime-default-smoke` opt-in real-API script
+
+New `npm run runtime-default-smoke` script. Opt-in via `CROSS_REVIEW_V2_REAL_API_SMOKE=1`; default exits 0 with "skipping" message. Exercises live provider 4xx surfaces so the docs-hint path (item 5) and per-model allowlist gate (item 6) prove themselves in production conditions, not synthetic stubs. Currently exercises Grok; extensible to other peers by editing the `PEERS_TO_TEST` env list. Returns non-zero only when the runtime should have gated a parameter that the provider rejected — a real regression — and benign reasons (auth, network) are reported as informational.
+
+### Added — Item 4A: boot notice for non-allowlist Grok + custom effort
+
+When the operator sets `CROSS_REVIEW_GROK_REASONING_EFFORT` to a non-default value AND the configured Grok model is NOT in the reasoning-effort allowlist, the boot notice surfaces a one-time stderr line explaining: (a) the parameter is silently dropped on this model per docs at https://docs.x.ai/docs/guides/reasoning, (b) the override has no effect, (c) the operator can switch to `grok-4.20-multi-agent` to honor it. Mirrors the existing `xhigh` warning cadence.
+
+### Added — Item 5: 4xx parameter-rejection docs-hint enforcement
+
+When `classifyProviderError` sees a 4xx error message that cites a named provider parameter (e.g. "Argument not supported on this model: reasoning.effort"), the failure now carries `recovery_hint: "consult_docs_then_revise"` plus a structured `docs_hint: { parameter, docs_url }` pointing at the official docs page for that parameter (xAI deep link for `reasoning.effort`, OpenAI Responses API reference, Anthropic extended thinking page, etc.). The companion `reformulation_advice` cites the workspace `feedback_consult_docs_before_amputating.md` HARD RULE verbatim and recommends the allowlist-gate fix (model-capability detection) over amputation. Surface enforces the rule at runtime so any future ship hitting a 4xx parameter rejection sees the docs link and the "do NOT amputate" guidance immediately.
+
+- New `recovery_hint` enum value: `consult_docs_then_revise`.
+- New `PeerFailure.docs_hint?: { parameter, docs_url? }` field.
+- Two regex patterns (prefix form: `"<keyword>: <param>"`; suffix form: `"parameter <param> is not supported"`) to catch common 4xx shapes across providers.
+- Provider docs URL maps for openai/anthropic/google/deepseek/xai with deep links for known sticky parameters (`reasoning.effort`, `thinking`).
+- New smoke marker `provider_4xx_param_rejection_docs_hint_test` (canonical xAI 400 + negative case for generic 4xx).
+
+### Added — Item 6: per-model reasoning capability allowlist (Grok)
+
+`peers/grok.ts` exports `GROK_REASONING_EFFORT_MODELS: ReadonlySet<string>` (currently `{"grok-4.20-multi-agent"}`) plus `modelAcceptsReasoningEffort(model)`. The Grok adapter's request body conditionally includes `reasoning: { effort }` only when the configured model is in the allowlist; non-allowlist models (`grok-4-latest`, `grok-4.3`, `grok-3-fast`, etc.) get the parameter omitted and rely on xAI's automatic reasoning. This frees the operator from being locked to `grok-4.20-multi-agent` (v2.14.1 hotfix) — any Grok model now works for cross-review.
+
+- New smoke marker `grok_reasoning_capability_allowlist_test` (positive + negative cases + Set size assertion as a future-additions guard).
+- Future: when xAI exposes a model-capability discovery endpoint, replace the static set with a runtime probe + cache.
+
+### Changed
+
+- `package.json` version: `2.14.1` → `2.15.0`.
+- 6 MCP host configs (`.mcp.json`, `.vscode/mcp.json`, `.gemini/settings.json`, `.codex/config.toml`, `.gemini/antigravity/mcp_config.json`, `.grok/settings.json`) now expose `CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_CONSENSUS_PEERS=""` so the toggle is visible to operators and switching to consensus mode is a one-line edit (`""` → `"codex,gemini,deepseek"`).
+
+### Smoke markers (4 new on top of v2.14.x's 51, total 55)
+
+`grok_reasoning_capability_allowlist_test`, `consensus_autowire_config_parsed_test`, `per_call_reasoning_effort_overrides_accepted_test`, `provider_4xx_param_rejection_docs_hint_test`.
+
 ## [v02.14.01] - 2026-05-04
 
 **Hotfix: Grok default model switched to `grok-4.20-multi-agent` so `reasoning.effort` works.** Functional verification of v2.14.0 against the real xAI API surfaced a 400: `Model grok-4-latest does not support parameter reasoningEffort`. Operator-directed re-check against official xAI docs at https://docs.x.ai/docs/guides/reasoning confirmed: only `grok-4.20-multi-agent` accepts the `reasoning.effort` parameter — all other Grok-4 models (`grok-4.3`, `grok-4-1-fast`, and the `grok-4-latest` alias that resolves to one of them) reject it with a 400. v2.14.0's default was `grok-4-latest`, hence the rejection.

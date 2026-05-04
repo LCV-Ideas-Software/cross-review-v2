@@ -18,7 +18,7 @@ function expandHome(rawPath: string): string {
   return rawPath;
 }
 
-export const VERSION = "2.14.1";
+export const VERSION = "2.15.0";
 export const RELEASE_DATE = "2026-05-04";
 export const DEFAULT_MAX_OUTPUT_TOKENS = 20_000;
 const COST_RATE_ENV_PREFIX: Record<PeerId, string> = {
@@ -269,12 +269,28 @@ function loadEvidenceJudgeAutowireConfig(): import("./types.js").EvidenceJudgeAu
     .trim()
     .toLowerCase();
   const rawPeer = (process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_PEER ?? "").trim();
-  const peerKnown: PeerId[] = ["codex", "claude", "gemini", "deepseek"];
+  const rawConsensusPeers = (
+    process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_CONSENSUS_PEERS ?? ""
+  ).trim();
+  const peerKnown: PeerId[] = ["codex", "claude", "gemini", "deepseek", "grok"];
   const peer = (peerKnown as readonly string[]).includes(rawPeer) ? (rawPeer as PeerId) : undefined;
+  // v2.15.0 (item 1): parse consensus peers list. Comma-separated; only
+  // peers that are members of PEERS are kept. Need >=2 valid entries
+  // for consensus to apply (orchestrator guard); below 2 falls back to
+  // single-peer autowire.
+  const consensusPeers: PeerId[] = rawConsensusPeers
+    ? rawConsensusPeers
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter((entry) => (peerKnown as readonly string[]).includes(entry))
+        .map((entry) => entry as PeerId)
+    : [];
   const mode = rawMode === "" ? "off" : rawMode;
   // v2.14.0 (item 2): "active" promoted to first-class autowire mode.
-  // `active` flag is true when mode is shadow OR active AND peer valid.
-  const active = (mode === "shadow" || mode === "active") && peer !== undefined;
+  // v2.15.0 (item 1): consensus path also activates `active` when
+  // consensus_peers >= 2 (single-peer field becomes optional in that case).
+  const active =
+    (mode === "shadow" || mode === "active") && (peer !== undefined || consensusPeers.length >= 2);
   // v2.12.0: preserve EXACT pre-v2.12 semantics. The legacy inline read
   // was `Number.parseInt(env ?? "8", 10) || 8` — this lets negative
   // values flow through (because `-5 || 8 === -5` in JS) so the
@@ -294,6 +310,8 @@ function loadEvidenceJudgeAutowireConfig(): import("./types.js").EvidenceJudgeAu
     max_items_per_pass: maxItemsPerPass,
     configured_mode_raw: rawMode,
     configured_peer_raw: rawPeer,
+    consensus_peers: consensusPeers,
+    configured_consensus_peers_raw: rawConsensusPeers,
   };
 }
 

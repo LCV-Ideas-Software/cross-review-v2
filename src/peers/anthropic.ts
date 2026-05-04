@@ -126,7 +126,9 @@ export class AnthropicAdapter extends BasePeerAdapter implements PeerAdapter {
           ],
           thinking: anthropicThinking(),
           output_config: {
-            effort: anthropicEffort(this.config.reasoning_effort.claude),
+            effort: anthropicEffort(
+              context.reasoning_effort_override ?? this.config.reasoning_effort.claude,
+            ),
             format: {
               type: "json_schema" as const,
               schema: statusJsonSchema,
@@ -201,7 +203,9 @@ export class AnthropicAdapter extends BasePeerAdapter implements PeerAdapter {
           messages: [{ role: "user" as const, content: userPrompt(prompt) }],
           thinking: anthropicThinking(),
           output_config: {
-            effort: anthropicEffort(this.config.reasoning_effort.claude),
+            effort: anthropicEffort(
+              context.reasoning_effort_override ?? this.config.reasoning_effort.claude,
+            ),
           },
         };
         if (this.shouldStreamTokens(context)) {

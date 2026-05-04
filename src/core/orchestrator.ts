@@ -11,6 +11,7 @@ import type {
   PeerId,
   PeerProbeResult,
   PeerResult,
+  ReasoningEffort,
   ReviewRound,
   ReviewStatus,
   RuntimeEvent,
@@ -38,6 +39,9 @@ export interface AskPeersInput {
   caller_status?: ReviewStatus;
   peers?: PeerId[];
   signal?: AbortSignal;
+  // v2.15.0 (item 2): per-call reasoning_effort overrides. See
+  // RunUntilUnanimousInput for full rationale. Empty / unset => global default.
+  reasoning_effort_overrides?: Partial<Record<PeerId, ReasoningEffort>>;
 }
 
 export interface AskPeersOutput {
@@ -57,6 +61,11 @@ export interface RunUntilUnanimousInput {
   until_stopped?: boolean;
   max_cost_usd?: number;
   signal?: AbortSignal;
+  // v2.15.0 (item 2): per-call reasoning_effort overrides. Operator uses
+  // this to dial down expensive peers (especially Grok 16-agent xhigh)
+  // for routine cross-reviews without editing 6 MCP configs. Falls back
+  // to `config.reasoning_effort[peer_id]` when peer has no override here.
+  reasoning_effort_overrides?: Partial<Record<PeerId, ReasoningEffort>>;
   // v2.11.0: caller identifies the petitioner (peer or operator) for the
   // relator-lottery + self-review prohibition. Defaults to "operator" when
   // omitted, which preserves v2.10.0 behavior (no exclusion). When caller
@@ -947,7 +956,8 @@ export class CrossReviewOrchestrator {
           continue;
         }
         // r.error was checked above; non-error path implies judgment present.
-        const j = r.judgment!;
+        if (!r.judgment) continue;
+        const j = r.judgment;
         const rationaleEmpty = !j.rationale || j.rationale.trim() === "";
         const isVerifiedSatisfied =
           j.satisfied === true &&
@@ -1908,6 +1918,7 @@ export class CrossReviewOrchestrator {
           stream: this.config.streaming.events,
           stream_tokens: this.config.streaming.tokens,
           emit: this.emit,
+          reasoning_effort_override: input.reasoning_effort_overrides?.[adapter.id],
         }),
       ),
     );
@@ -2092,6 +2103,7 @@ export class CrossReviewOrchestrator {
               signal: input.signal,
               stream_tokens: this.config.streaming.tokens,
               emit: this.emit,
+              reasoning_effort_override: input.reasoning_effort_overrides?.[adapter.id],
             });
             const parserWarnings = [
               ...peerResult.parser_warnings.map((warning) => `original:${warning}`),
@@ -2271,13 +2283,53 @@ export class CrossReviewOrchestrator {
     if (autowire.mode === "shadow" || autowire.mode === "active") {
       const checklistAfter = this.store.read(session.session_id).evidence_checklist ?? [];
       const hasOpenItems = checklistAfter.some((item) => (item.status ?? "open") === "open");
-      if (autowire.peer === undefined) {
+      // v2.15.0 (item 1): consensus path takes precedence over single-peer
+      // when CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_CONSENSUS_PEERS lists
+      // at least 2 enabled peers. Operator-flexible: keeps single-peer
+      // backward-compatible while letting the operator opt into consensus
+      // without code changes.
+      const consensusEnabled = autowire.consensus_peers.filter(
+        (peer) => this.config.peer_enabled[peer],
+      );
+      const useConsensus = consensusEnabled.length >= 2;
+      if (useConsensus && !hasOpenItems) {
+        // No open items → nothing to judge. Skip silently.
+      } else if (useConsensus) {
+        try {
+          await this.runEvidenceChecklistJudgeConsensusPass({
+            session_id: session.session_id,
+            judge_peers: consensusEnabled,
+            draft: input.draft,
+            round: round.round,
+            mode: autowire.mode,
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          this.emit({
+            type: "session.evidence_judge_pass.autowire_failed",
+            session_id: session.session_id,
+            round: round.round,
+            message: `Autowire ${autowire.mode} consensus pass failed: ${message}`,
+            data: {
+              mode: autowire.mode,
+              judge_peers: consensusEnabled,
+              consensus: true,
+              error: message,
+            },
+          });
+        }
+      } else if (autowire.peer === undefined) {
         this.emit({
           type: "session.evidence_judge_pass.autowire_skipped",
           session_id: session.session_id,
           round: round.round,
-          message: `Autowire enabled but CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_PEER is missing or unknown (got "${autowire.configured_peer_raw}"); ${autowire.mode} pass skipped.`,
-          data: { mode: autowire.mode, configured_peer: autowire.configured_peer_raw },
+          message: `Autowire enabled but neither CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_PEER (got "${autowire.configured_peer_raw}") nor CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_CONSENSUS_PEERS (got "${autowire.configured_consensus_peers_raw}", needs >=2 enabled peers) resolved to a valid configuration; ${autowire.mode} pass skipped.`,
+          data: {
+            mode: autowire.mode,
+            configured_peer: autowire.configured_peer_raw,
+            configured_consensus_peers: autowire.configured_consensus_peers_raw,
+            enabled_consensus_count: consensusEnabled.length,
+          },
         });
       } else if (!hasOpenItems) {
         // No open items → nothing to judge. Skip silently to avoid
@@ -2507,6 +2559,7 @@ export class CrossReviewOrchestrator {
           stream: this.config.streaming.events,
           stream_tokens: this.config.streaming.tokens,
           emit: this.emit,
+          reasoning_effort_override: input.reasoning_effort_overrides?.[leadPeer],
         },
       );
       this.store.saveGeneration(session.session_id, 0, generation, "initial-draft");
@@ -2557,6 +2610,7 @@ export class CrossReviewOrchestrator {
         peers: reviewerPeers.length ? reviewerPeers : selectedPeers,
         review_focus: input.review_focus,
         signal: input.signal,
+        reasoning_effort_overrides: input.reasoning_effort_overrides,
       });
       session = this.store.read(session.session_id);
       if (result.converged) {
@@ -2649,6 +2703,7 @@ export class CrossReviewOrchestrator {
             stream: this.config.streaming.events,
             stream_tokens: this.config.streaming.tokens,
             emit: this.emit,
+            reasoning_effort_override: input.reasoning_effort_overrides?.[leadPeer],
           },
         );
         this.store.saveGeneration(session.session_id, round, generation, "revision");

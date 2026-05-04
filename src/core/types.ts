@@ -140,11 +140,23 @@ export interface PeerFailure {
     | "unknown";
   message: string;
   retryable: boolean;
-  recovery_hint?: "wait_and_retry" | "reformulate_and_retry";
+  recovery_hint?: "wait_and_retry" | "reformulate_and_retry" | "consult_docs_then_revise";
   reformulation_advice?: string;
   retry_after_ms?: number;
   attempts: number;
   latency_ms: number;
+  // v2.15.0 (item 5): when a provider 4xx error message cites a named
+  // parameter (e.g. "Argument not supported on this model: reasoning.effort"),
+  // the classifier surfaces a `consult_docs_then_revise` hint pointing
+  // at the official docs URL for the offending field. This enforces the
+  // workspace HARD RULE `feedback_consult_docs_before_amputating.md`:
+  // operators should consult the official docs FIRST and never amputate
+  // a feature to silence a 400. The field is set by classifyProviderError
+  // when the regex below matches and a docs URL is known for the peer.
+  docs_hint?: {
+    parameter: string;
+    docs_url?: string;
+  };
 }
 
 export interface InFlightRound {
@@ -347,6 +359,16 @@ export interface PeerCallContext {
   stream?: boolean;
   stream_tokens?: boolean;
   emit(event: RuntimeEvent): void;
+  // v2.15.0 (item 2): per-call reasoning_effort override. When supplied,
+  // the adapter reads this instead of `config.reasoning_effort[peer_id]`
+  // for the current call. Operator uses this to dial down expensive
+  // peers (e.g. Grok grok-4.20-multi-agent xhigh = 16 agents = $1+/call)
+  // for routine cross-reviews while keeping the global default at xhigh
+  // for ship-critical paths. The adapter is responsible for honoring
+  // the field; OpenAI/Anthropic/Gemini/DeepSeek treat it as
+  // chain-of-thought depth, Grok treats it as agent count (semantic
+  // divergence per peers/grok.ts header).
+  reasoning_effort_override?: ReasoningEffort;
 }
 
 export interface PeerProbeResult {
@@ -524,6 +546,15 @@ export interface EvidenceJudgeAutowireConfig {
   max_items_per_pass: number;
   configured_mode_raw: string;
   configured_peer_raw: string;
+  // v2.15.0 (item 1): consensus-based autowire. When set (>=2 enabled
+  // peers), the autowire path dispatches to
+  // runEvidenceChecklistJudgeConsensusPass instead of single-peer judge.
+  // Promotes only when ALL peers return verified-satisfied. Set via env
+  // CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_CONSENSUS_PEERS=peer1,peer2,...
+  // (comma-separated). Empty list (or single-peer or invalid) → falls
+  // back to the v2.12.0 single-peer autowire path.
+  consensus_peers: PeerId[];
+  configured_consensus_peers_raw: string;
 }
 
 // v2.8.0: per-peer health roll-up surfaced through the runtime metrics
