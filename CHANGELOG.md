@@ -9,6 +9,21 @@ standard `v00.00.00`; npm package versions remain SemVer.
 
 _No entries yet._
 
+## [v02.15.01] - 2026-05-04
+
+**Hotfix: `server_info` surfaces `consensus_peers` + `configured_consensus_peers_raw`.** v2.15.0 added the multi-peer judge consensus parser to `AppConfig.evidence_judge_autowire` and wired the dispatcher to honor `consensus_peers >= 2` correctly, but the `server_info` MCP tool handler at `src/mcp/server.ts:292` only serialized the v2.12.0 fields (`mode`, `peer`, `active`, `max_items_per_pass`, `configured_mode_raw`, `configured_peer_raw`). Operators setting `CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_CONSENSUS_PEERS` saw no evidence of the configuration in `server_info` even though the dispatch path was using it — silent visibility regression caught when the operator inspected `server_info` after configuring 6 MCP hosts with per-host consensus peer lists.
+
+Operator directive: every config the parser supports MUST be visible via `server_info` for operator audit. Hotfix adds the two missing fields to the serialized payload.
+
+### Changed
+
+- `src/mcp/server.ts` `evidence_judge_autowire` block now includes `consensus_peers: PeerId[]` and `configured_consensus_peers_raw: string`.
+- New smoke marker `server_info_surfaces_consensus_peers_test` reads `src/mcp/server.ts` and asserts both property names appear in the `evidence_judge_autowire` block — locks in the regression so future field additions don't silently miss serialization again.
+
+### Why this gap was not caught in v2.15.0
+
+The v2.15.0 smoke marker `consensus_autowire_config_parsed_test` validated that `loadConfig()` correctly produced `consensus_peers` and `configured_consensus_peers_raw` from the env var, and the dispatch path was exercised by `judge_consensus_pass_test`. Neither test invoked the `server_info` MCP tool handler. The v2.12.0 fields were carried over from the original handler and the new fields were added to the parser without revisiting the serializer — a copy-paste-class oversight that the v2.15.1 marker now fences.
+
 ## [v02.15.00] - 2026-05-04
 
 **v2.15.0 ships the 6 backlog items from `project_cross_review_v2_v215_backlog_candidates.md` as a single minor bump (operator directive 2026-05-04: "Quero TODOS implementados").** Driven by functional testing of v2.14.x against the real xAI API, which surfaced the `reasoning.effort` model-rejection that birthed the `feedback_consult_docs_before_amputating.md` HARD RULE. v2.15.0 codifies that rule at three levels: per-model capability allowlist (item 6), runtime 4xx docs-pointer (item 5), and operator-triggered per-call effort overrides (item 2) so dialing parameters down per-call is a first-class option rather than a config-edit detour.

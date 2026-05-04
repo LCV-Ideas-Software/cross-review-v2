@@ -289,6 +289,11 @@ export async function main(): Promise<void> {
           // v2.12.0: judge auto-wire is now a first-class observable. Operators
           // checking `server_info` know whether shadow is collecting data,
           // which peer is rated, and whether a typo invalidated the config.
+          // v2.15.1: surface `consensus_peers` and `configured_consensus_peers_raw`
+          // so the multi-peer judge configuration (parsed from
+          // CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_CONSENSUS_PEERS) is visible
+          // here instead of silently invisible despite being honored by the
+          // dispatcher. v2.15.0 added the parser but forgot the serialization.
           evidence_judge_autowire: {
             mode: runtime.config.evidence_judge_autowire.mode,
             peer: runtime.config.evidence_judge_autowire.peer ?? null,
@@ -296,6 +301,9 @@ export async function main(): Promise<void> {
             max_items_per_pass: runtime.config.evidence_judge_autowire.max_items_per_pass,
             configured_mode_raw: runtime.config.evidence_judge_autowire.configured_mode_raw,
             configured_peer_raw: runtime.config.evidence_judge_autowire.configured_peer_raw,
+            consensus_peers: runtime.config.evidence_judge_autowire.consensus_peers,
+            configured_consensus_peers_raw:
+              runtime.config.evidence_judge_autowire.configured_consensus_peers_raw,
           },
           // v2.14.0: per-peer enable/disable surface. Operators inspecting
           // server_info see the resolved enabled/disabled state of each peer.

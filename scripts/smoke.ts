@@ -3689,6 +3689,32 @@ assert.equal(Object.hasOwn(metrics.decision_quality, "undefined"), false);
   console.log("[smoke] consensus_autowire_config_parsed_test: PASS");
 }
 
+// v2.15.1 hotfix — server_info MUST surface `consensus_peers` and
+// `configured_consensus_peers_raw`. v2.15.0 parser exposed these fields
+// on AppConfig but the server_info handler at src/mcp/server.ts:292
+// forgot to include them in the serialized response, so operators
+// inspecting `server_info` saw no evidence of their consensus
+// configuration even when the dispatcher was honoring it. Marker reads
+// the source of server.ts to assert the two property names appear in
+// the evidence_judge_autowire block.
+{
+  const fs = await import("node:fs");
+  const serverSource = fs.readFileSync("src/mcp/server.ts", "utf8");
+  const blockStart = serverSource.indexOf("evidence_judge_autowire: {");
+  const blockEnd = serverSource.indexOf("}", blockStart);
+  assert.ok(
+    blockStart !== -1 && blockEnd !== -1,
+    "server.ts must define evidence_judge_autowire block",
+  );
+  const block = serverSource.slice(blockStart, blockEnd);
+  assert.ok(block.includes("consensus_peers:"), "server_info must serialize consensus_peers");
+  assert.ok(
+    block.includes("configured_consensus_peers_raw:"),
+    "server_info must serialize configured_consensus_peers_raw",
+  );
+  console.log("[smoke] server_info_surfaces_consensus_peers_test: PASS");
+}
+
 // v2.15.0 (item 2) — per-call reasoning_effort overrides. The orchestrator
 // threads `reasoning_effort_overrides[peer]` into the PeerCallContext that
 // reaches each adapter; adapters with an effort knob (codex/claude/grok/
