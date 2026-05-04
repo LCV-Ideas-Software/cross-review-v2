@@ -138,7 +138,11 @@ export class OpenAIAdapter extends BasePeerAdapter implements PeerAdapter {
             },
             verbosity: "low" as const,
           },
-          reasoning: { effort: openAIEffort(this.config.reasoning_effort.codex) },
+          reasoning: {
+            effort: openAIEffort(
+              context.reasoning_effort_override ?? this.config.reasoning_effort.codex,
+            ),
+          },
           store: false,
           // OpenAI Responses API uses max_output_tokens, not Chat Completions max_tokens.
           max_output_tokens: this.config.max_output_tokens,
@@ -219,7 +223,11 @@ export class OpenAIAdapter extends BasePeerAdapter implements PeerAdapter {
             { role: "system" as const, content: this.systemPrompt(context) },
             { role: "user" as const, content: userPrompt(prompt) },
           ],
-          reasoning: { effort: openAIEffort(this.config.reasoning_effort.codex) },
+          reasoning: {
+            effort: openAIEffort(
+              context.reasoning_effort_override ?? this.config.reasoning_effort.codex,
+            ),
+          },
           store: false,
           max_output_tokens: this.config.max_output_tokens,
         };

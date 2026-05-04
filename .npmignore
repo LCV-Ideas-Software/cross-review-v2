@@ -2,31 +2,46 @@
 # but these patterns keep local runtime and variable files out if packaging
 # rules are changed later.
 
-# Dependencies and build scratch
+# Dependencies and package-manager state
 node_modules/
+.pnp.*
+.npm/
+.yarn/
+.pnpm-store/
+
+# Build scratch and generated local output
 coverage/
+.nyc_output/
 .turbo/
 .cache/
 
-# Runtime state
+# Runtime state and local cross-review data
 data/
 sessions/
 logs/
 artifacts/
+pids/
 .tmp/
 tmp/
 temp/
 cache/
 *.tmp
 *.tmp.*
+*.bak
+*.orig
 *.log
 *.pid
+*.seed
+*.pid.lock
 *.ndjson
+probe-results.json
+.cross-review/
 
 # Variable files and local secrets
 .env
 .env.*
 *.env
+.npmrc
 *.pem
 *.key
 *.pfx
@@ -40,10 +55,29 @@ vault.json
 vault*.json
 oauth_creds.json
 
-# Local AI context
+# Repository automation and development-only material
+.github/
+.vscode/
+.idea/
+.gitattributes
+.gitignore
+.prettierignore
+.prettierrc.json
+scripts/
+src/
+test/
+tests/
+
+# AI-agent local memory and private context
 .ai/
+AGENTS.md
 AGENTS.local.md
 CLAUDE.md
 GEMINI.md
 memory/
 memories/
+.claude/
+.gemini/
+.cursor/
+.continue/
+.windsurf/

@@ -189,7 +189,7 @@ const adapterExpectations: Array<{ file: string; field: string }> = [
   { file: "src/peers/deepseek.ts", field: "max_tokens: this.config.max_output_tokens" },
   { file: "src/peers/deepseek.ts", field: 'type: "enabled"' },
   { file: "src/peers/deepseek.ts", field: "reasoning_effort:" },
-  { file: "src/peers/deepseek.ts", field: "...deepSeekThinking(this.config)" },
+  { file: "src/peers/deepseek.ts", field: "...deepSeekThinking(this.config" },
   { file: "src/peers/deepseek.ts", field: "stream: true" },
   { file: "src/mcp/server.ts", field: "token_streaming: runtime.config.streaming.tokens" },
 ];
@@ -3638,6 +3638,128 @@ assert.equal(Object.hasOwn(metrics.decision_quality, "undefined"), false);
     `lottery must occasionally pick grok (got pool: ${[...seen].join(", ")})`,
   );
   console.log("[smoke] grok_integration_test: PASS");
+}
+
+// v2.15.0 (item 6) — per-model reasoning capability detection. Allowlist
+// `GROK_REASONING_EFFORT_MODELS = {"grok-4.20-multi-agent"}` controls
+// whether the GrokAdapter includes `reasoning.effort` in the request
+// body. Other Grok models (per xAI docs) reject the param OR auto-apply
+// reasoning internally, so we omit it.
+{
+  const { modelAcceptsReasoningEffort, GROK_REASONING_EFFORT_MODELS } =
+    await import("../src/peers/grok.js");
+  // Allowlist contract: only grok-4.20-multi-agent.
+  assert.equal(modelAcceptsReasoningEffort("grok-4.20-multi-agent"), true);
+  assert.equal(modelAcceptsReasoningEffort("grok-4-latest"), false);
+  assert.equal(modelAcceptsReasoningEffort("grok-4.3"), false);
+  assert.equal(modelAcceptsReasoningEffort("grok-4-1-fast"), false);
+  assert.equal(modelAcceptsReasoningEffort("grok-3"), false);
+  assert.equal(modelAcceptsReasoningEffort("grok-3-fast"), false);
+  // Set is exposed as ReadonlySet so future xAI additions are a 1-line
+  // change in peers/grok.ts. Test asserts the expected size + content.
+  assert.equal(GROK_REASONING_EFFORT_MODELS.size, 1);
+  assert.ok(GROK_REASONING_EFFORT_MODELS.has("grok-4.20-multi-agent"));
+  console.log("[smoke] grok_reasoning_capability_allowlist_test: PASS");
+}
+
+// v2.15.0 (item 1) — consensus-based autowire config. Operator sets
+// CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_CONSENSUS_PEERS=codex,gemini,deepseek
+// + MODE=shadow → boot parses 3 enabled peers into `consensus_peers`
+// and flips `active=true`. Boot trace also exposes the raw env value via
+// `configured_consensus_peers_raw` for operator debugging.
+{
+  process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_MODE = "shadow";
+  process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_CONSENSUS_PEERS = "codex,gemini,deepseek";
+  delete process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_PEER;
+  const { loadConfig } = await import("../src/core/config.js");
+  const cfg = loadConfig();
+  assert.equal(cfg.evidence_judge_autowire.mode, "shadow");
+  assert.equal(cfg.evidence_judge_autowire.consensus_peers.length, 3);
+  assert.deepEqual([...cfg.evidence_judge_autowire.consensus_peers].sort(), [
+    "codex",
+    "deepseek",
+    "gemini",
+  ]);
+  assert.equal(cfg.evidence_judge_autowire.configured_consensus_peers_raw, "codex,gemini,deepseek");
+  assert.equal(cfg.evidence_judge_autowire.peer, undefined);
+  // active flips on when consensus_peers >= 2
+  assert.equal(cfg.evidence_judge_autowire.active, true);
+  delete process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_MODE;
+  delete process.env.CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_CONSENSUS_PEERS;
+  console.log("[smoke] consensus_autowire_config_parsed_test: PASS");
+}
+
+// v2.15.0 (item 2) — per-call reasoning_effort overrides. The orchestrator
+// threads `reasoning_effort_overrides[peer]` into the PeerCallContext that
+// reaches each adapter; adapters with an effort knob (codex/claude/grok/
+// deepseek) read `context.reasoning_effort_override ?? config.reasoning_effort[peer]`.
+// This test does NOT exercise the network — it inspects the AskPeersInput
+// type contract and the orchestrator+adapter wiring via type-only import
+// + a runtime smoke through the stub adapter (stub ignores effort, but
+// the field must traverse without throwing).
+{
+  const reConfig = {
+    ...loadConfig(),
+    data_dir: smokeTmpDir("reasoning-overrides"),
+    budget: {
+      ...loadConfig().budget,
+      max_session_cost_usd: 10000,
+      preflight_max_round_cost_usd: 10000,
+      until_stopped_max_cost_usd: 10000,
+    },
+  };
+  const reOrch = new CrossReviewOrchestrator(reConfig, () => {});
+  const reSession = await reOrch.initSession("reasoning-overrides", "operator");
+  // Pass a per-call override map; stub ignores it, but the call must
+  // not reject (proves the type + zod contract is stable).
+  const reOut = await reOrch.askPeers({
+    session_id: reSession.session_id,
+    task: "reasoning-overrides",
+    draft: "ok",
+    peers: ["codex", "claude", "grok"],
+    reasoning_effort_overrides: { codex: "low", claude: "medium", grok: "minimal" },
+  });
+  assert.ok(reOut.round, "askPeers must return a round when overrides are supplied");
+  console.log("[smoke] per_call_reasoning_effort_overrides_accepted_test: PASS");
+}
+
+// v2.15.0 (item 5) — provider 4xx parameter-rejection docs hint. When
+// classifyProviderError sees a 4xx error message that cites a named
+// parameter, the failure must surface `recovery_hint:"consult_docs_then_revise"`,
+// `docs_hint.parameter`, and `docs_hint.docs_url`. Enforces workspace
+// HARD RULE feedback_consult_docs_before_amputating.md at runtime so
+// agents see the docs link instead of reaching for amputation.
+{
+  const { classifyProviderError } = await import("../src/peers/errors.js");
+  // Canonical xAI Grok 400 phrasing for `reasoning.effort` on a
+  // non-multi-agent model (the 2026-05-04 incident that birthed the rule).
+  const err = new Error(
+    "400 Argument not supported on this model: reasoning.effort. Refer to the documentation for details.",
+  );
+  const failure = classifyProviderError("grok", "xai", "grok-4-latest", err, 1, Date.now());
+  assert.equal(
+    failure.recovery_hint,
+    "consult_docs_then_revise",
+    "param-rejection 4xx must produce consult_docs_then_revise hint",
+  );
+  assert.ok(failure.docs_hint, "failure must carry docs_hint");
+  assert.equal(failure.docs_hint?.parameter, "reasoning.effort");
+  assert.equal(
+    failure.docs_hint?.docs_url,
+    "https://docs.x.ai/docs/guides/reasoning",
+    "xAI reasoning.effort must point to guides/reasoning",
+  );
+  assert.match(
+    failure.reformulation_advice ?? "",
+    /HARD RULE.*consult_docs_before_amputating/i,
+    "advice must surface the workspace HARD RULE link",
+  );
+  // Negative: a generic provider error without a named parameter must
+  // NOT trigger the docs hint (avoid false positives on unrelated 4xx).
+  const generic = new Error("400 Bad Request");
+  const noHint = classifyProviderError("codex", "openai", "gpt-5", generic, 1, Date.now());
+  assert.equal(noHint.docs_hint, undefined, "generic 4xx must not synthesize docs_hint");
+  console.log("[smoke] provider_4xx_param_rejection_docs_hint_test: PASS");
 }
 
 // v2.6.1 NOTE: smoke coverage for `peer.fallback.budget_blocked` and

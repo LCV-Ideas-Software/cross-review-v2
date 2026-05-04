@@ -86,6 +86,32 @@ function grokEffort(value: AppConfig["reasoning_effort"][PeerId]): GrokReasoning
   return value === "max" ? "xhigh" : (value ?? "xhigh");
 }
 
+// v2.15.0 (operator directive 2026-05-04, item 6): per-model reasoning
+// capability detection. Per official xAI docs at
+// https://docs.x.ai/docs/guides/reasoning, only `grok-4.20-multi-agent`
+// accepts the `reasoning.effort` body field. Other Grok models
+// (grok-4.3, grok-4-1-fast, grok-4-latest aliased to those, grok-3,
+// grok-3-fast) reject it with a 400 BUT have automatic reasoning on
+// by design — the field is unnecessary for them.
+//
+// Pre-v2.15 the GrokAdapter unconditionally included
+// `reasoning: { effort }` in every body, locking the operator to
+// `grok-4.20-multi-agent` to avoid 400s (v2.14.1 hotfix). v2.15
+// detects the configured model and omits the field for non-allowlist
+// models, freeing the operator to use ANY Grok model — including
+// cheaper ones for routine cross-reviews while reserving 16-agent
+// xhigh runs for heavy tasks.
+//
+// Allowlist is an explicit Set so adding a new reasoning-capable
+// model is a one-line change here. Future: if xAI exposes a model
+// capability discovery endpoint, replace the static set with a
+// runtime probe + cache.
+export const GROK_REASONING_EFFORT_MODELS: ReadonlySet<string> = new Set(["grok-4.20-multi-agent"]);
+
+export function modelAcceptsReasoningEffort(model: string): boolean {
+  return GROK_REASONING_EFFORT_MODELS.has(model);
+}
+
 export class GrokAdapter extends BasePeerAdapter implements PeerAdapter {
   id: PeerId = "grok";
   provider = "xai";
@@ -175,7 +201,15 @@ export class GrokAdapter extends BasePeerAdapter implements PeerAdapter {
             },
             verbosity: "low" as const,
           },
-          reasoning: { effort: grokEffort(this.config.reasoning_effort.grok) },
+          ...(modelAcceptsReasoningEffort(this.model)
+            ? {
+                reasoning: {
+                  effort: grokEffort(
+                    context.reasoning_effort_override ?? this.config.reasoning_effort.grok,
+                  ),
+                },
+              }
+            : {}),
           store: false,
           max_output_tokens: this.config.max_output_tokens,
         };
@@ -255,7 +289,15 @@ export class GrokAdapter extends BasePeerAdapter implements PeerAdapter {
             { role: "system" as const, content: this.systemPrompt(context) },
             { role: "user" as const, content: userPrompt(prompt) },
           ],
-          reasoning: { effort: grokEffort(this.config.reasoning_effort.grok) },
+          ...(modelAcceptsReasoningEffort(this.model)
+            ? {
+                reasoning: {
+                  effort: grokEffort(
+                    context.reasoning_effort_override ?? this.config.reasoning_effort.grok,
+                  ),
+                },
+              }
+            : {}),
           store: false,
           max_output_tokens: this.config.max_output_tokens,
         };

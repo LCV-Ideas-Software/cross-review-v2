@@ -58,11 +58,14 @@ function deepSeekReasoningEffort(
   return value === "max" || value === "xhigh" ? "max" : "high";
 }
 
-function deepSeekThinking(config: AppConfig): DeepSeekThinkingExtension {
+function deepSeekThinking(
+  config: AppConfig,
+  override?: AppConfig["reasoning_effort"][PeerId],
+): DeepSeekThinkingExtension {
   return {
     thinking: {
       type: "enabled",
-      reasoning_effort: deepSeekReasoningEffort(config.reasoning_effort.deepseek),
+      reasoning_effort: deepSeekReasoningEffort(override ?? config.reasoning_effort.deepseek),
     },
   };
 }
@@ -137,7 +140,7 @@ export class DeepSeekAdapter extends BasePeerAdapter implements PeerAdapter {
           message: `DeepSeek review attempt ${attempt}`,
         });
         const payload: DeepSeekChatPayload = {
-          ...deepSeekThinking(this.config),
+          ...deepSeekThinking(this.config, context.reasoning_effort_override),
           model: this.model,
           messages: [
             { role: "system", content: this.systemPrompt(context) },
@@ -219,7 +222,7 @@ export class DeepSeekAdapter extends BasePeerAdapter implements PeerAdapter {
           message: `DeepSeek generation attempt ${attempt}`,
         });
         const payload: DeepSeekChatPayload = {
-          ...deepSeekThinking(this.config),
+          ...deepSeekThinking(this.config, context.reasoning_effort_override),
           model: this.model,
           messages: [
             { role: "system", content: this.systemPrompt(context) },
