@@ -1,1 +1,9 @@
 .github/FUNDING.yml
+node_modules
+dist
+build
+target
+coverage
+.wrangler
+.next
+.cache

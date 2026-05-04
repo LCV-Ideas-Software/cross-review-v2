@@ -31,7 +31,9 @@
     "lint": "eslint . --max-warnings=0",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "format:public": "prettier --write \"**/README.md\" \"**/index.html\"",
+    "format:public:check": "prettier --check \"**/README.md\" \"**/index.html\""
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.92.0",
