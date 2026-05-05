@@ -21,13 +21,14 @@ npm install -g @lcv-ideas-software/cross-review-v2
 npm install -g @lcv-ideas-software/cross-review-v2 --registry=https://npm.pkg.github.com
 ```
 
-**Status.** Stable. Current release: **v02.16.00** (npm package `2.16.0`). See
+**Status.** Stable. Current release: **v02.17.00** (npm package `2.17.0`). See
 [CHANGELOG.md](./CHANGELOG.md) for the release history.
 
 The version history at a glance:
 
 | Release | Scope |
 |---|---|
+| **`v02.17.00`** | **HARD GATE — identity forgery rejection (operator directive 2026-05-05).** Empirical evidence flagrada: cross-review-v2 session `0994cbaf` foi criada por Codex com `caller=claude` (impersonação para auto-exclusão do real Claude da panel). Pre-v2.17.0 v2 nem capturava `clientInfo` da MCP initialize handshake — `caller` era trusted unconditionally. v2.17.0 adiciona `verifyCallerIdentity(declaredCaller, clientInfo)` que cross-checks o caller declarado contra `getCallerCandidatesFromClientInfo(clientInfo)`. Aplicado em todos os 6 handlers caller-accepting: `session_init`, `ask_peers`, `session_start_round`, `run_until_unanimous`, `session_start_unanimous`, `contest_verdict` (quando `new_caller` provided). Match → OK + `identity_verified=true`. clientInfo unknown → OK + `identity_verified=false` (legitimate override). `caller="operator"` → OK (no agent claim made). Mismatch OR multi-match clientInfo → throws `identity_forgery_blocked`. Smoke `identity_forgery_blocked_test` (6 sub-tests). Coordinated ship com `cross-review-v1 v1.9.0`. **Minor bump** porque public surface adds `identity_forgery_blocked` error. Cross-review trilateral bypassed por operator directive (security fix to the gate itself, would otherwise route through compromised gate). |
 | **`v02.16.00`** | **Tribunal protocol repair plus operational doctor.** Separates petitioner/caller from relator metadata, applies self-recusal to direct `ask_peers`, adds read-only `session_doctor`, fixes Windows smoke teardown, and refreshes provider model guidance from official docs. |
 | **`v02.15.01`** | **`server_info` consensus visibility hotfix.** Exposes `consensus_peers` and `configured_consensus_peers_raw` for evidence-judge autowire so operators can audit the same configuration the dispatcher is using. |
 | **`v02.15.00`** | **Backlog bundle for operational judge controls.** Added consensus-based judge autowire, per-call reasoning-effort overrides, opt-in real-API smoke, provider 4xx docs hints, and a Grok reasoning-capability allowlist while exposing consensus toggles across the six MCP host configs. |

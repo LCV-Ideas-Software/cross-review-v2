@@ -75,6 +75,74 @@ function textResult(value: unknown, responseFormat = "json") {
   return { content: [{ type: "text" as const, text }] };
 }
 
+// v2.17.0 (operator directive 2026-05-05): identity forgery rejection.
+// Pre-v2.17.0, `caller` arrived from input and was trusted unconditionally
+// — there was no `clientInfo` capture and no cross-check. An agent (e.g.
+// Codex CLI from the operator's terminal) could pass `caller="claude"`
+// while its MCP client identified itself as "codex", impersonating Claude
+// in tribunal sessions. Empirical evidence: cross-review-v2 session
+// `0994cbaf-c270-4eaa-b42b-a0e638b9d1b6` (2026-05-05T05:30:10Z) was
+// created by Codex with caller=claude for exactly this purpose.
+//
+// `getCallerCandidatesFromClientInfo` walks PEERS for substring matches
+// in clientInfo.name (lowercased). `verifyCallerIdentity` cross-checks
+// the declared `caller` (from input) against the substrings; mismatch
+// with a single-resolved client throws `identity_forgery_blocked`.
+//
+// Permissive cases preserved: (a) caller="operator" → OK (explicit
+// "I'm the human operator" identity, no agent claim made); (b) clientInfo
+// doesn't resolve to a known agent → OK (legitimate override for headless
+// hosts); (c) declared caller matches clientInfo-derived candidate → OK.
+//
+// Blocked: (1) declared caller is a known agent + clientInfo resolves to
+// a different known agent; (2) declared caller is a known agent +
+// clientInfo resolves to MULTIPLE known agents (ambiguous host cannot
+// validate the claim).
+export type ClientInfo = { name?: string; version?: string } | undefined;
+export function getCallerCandidatesFromClientInfo(clientInfo: ClientInfo): PeerId[] {
+  const name = String(clientInfo?.name || "").toLowerCase();
+  if (!name) return [];
+  const candidates: PeerId[] = [];
+  for (const peer of PEERS) {
+    if (name.includes(peer)) candidates.push(peer);
+  }
+  return candidates;
+}
+export function verifyCallerIdentity(
+  declaredCaller: PeerId | "operator",
+  clientInfo: ClientInfo,
+): { identity_verified: boolean; client_info_name: string | null } {
+  // operator is a non-agent identity; nothing to forge against PEERS list.
+  if (declaredCaller === "operator") {
+    return {
+      identity_verified: false, // no agent claim made; nothing to verify
+      client_info_name: clientInfo?.name ?? null,
+    };
+  }
+  const candidates = getCallerCandidatesFromClientInfo(clientInfo);
+  if (candidates.length === 0) {
+    // legitimate override for unknown hosts (headless orchestrator etc).
+    return {
+      identity_verified: false,
+      client_info_name: clientInfo?.name ?? null,
+    };
+  }
+  if (candidates.length >= 2) {
+    throw new Error(
+      `identity_forgery_blocked: clientInfo.name='${clientInfo?.name}' matches multiple agents (${candidates.join(", ")}); cannot validate declared caller='${declaredCaller}' against an ambiguous client. Pass the request from a host whose clientInfo.name resolves to a single agent.`,
+    );
+  }
+  if (candidates[0] !== declaredCaller) {
+    throw new Error(
+      `identity_forgery_blocked: declared caller='${declaredCaller}' contradicts clientInfo.name='${clientInfo?.name}' which resolves to '${candidates[0]}'. An agent cannot self-declare a different identity than its MCP host (operator directive 2026-05-05). If this is a legitimate cross-host setup, ensure clientInfo.name does not contain a different agent's name as substring.`,
+    );
+  }
+  return {
+    identity_verified: true,
+    client_info_name: clientInfo?.name ?? null,
+  };
+}
+
 type JobKind = "ask_peers" | "run_until_unanimous";
 export type JobStatus = {
   job_id: string;
@@ -383,11 +451,14 @@ export async function main(): Promise<void> {
         openWorldHint: true,
       },
     },
-    async ({ task, review_focus, caller, response_format }) =>
-      textResult(
+    async ({ task, review_focus, caller, response_format }) => {
+      // v2.17.0: identity forgery rejection (operator directive 2026-05-05).
+      verifyCallerIdentity(caller, server.server.getClientVersion());
+      return textResult(
         await runtime.orchestrator.initSession(task, caller, review_focus),
         response_format,
-      ),
+      );
+    },
   );
 
   server.registerTool(
@@ -458,8 +529,11 @@ export async function main(): Promise<void> {
         openWorldHint: true,
       },
     },
-    async ({ response_format, ...input }) =>
-      textResult(await runtime.orchestrator.askPeers(input), response_format),
+    async ({ response_format, ...input }) => {
+      // v2.17.0: identity forgery rejection (operator directive 2026-05-05).
+      verifyCallerIdentity(input.caller, server.server.getClientVersion());
+      return textResult(await runtime.orchestrator.askPeers(input), response_format);
+    },
   );
 
   server.registerTool(
@@ -493,6 +567,8 @@ export async function main(): Promise<void> {
       },
     },
     async ({ response_format, ...input }) => {
+      // v2.17.0: identity forgery rejection (operator directive 2026-05-05).
+      verifyCallerIdentity(input.caller, server.server.getClientVersion());
       const session = input.session_id
         ? runtime.orchestrator.store.read(input.session_id)
         : await runtime.orchestrator.initSession(input.task, input.caller, input.review_focus);
@@ -557,8 +633,11 @@ export async function main(): Promise<void> {
         openWorldHint: true,
       },
     },
-    async ({ response_format, ...input }) =>
-      textResult(await runtime.orchestrator.runUntilUnanimous(input), response_format),
+    async ({ response_format, ...input }) => {
+      // v2.17.0: identity forgery rejection (operator directive 2026-05-05).
+      verifyCallerIdentity(input.caller, server.server.getClientVersion());
+      return textResult(await runtime.orchestrator.runUntilUnanimous(input), response_format);
+    },
   );
 
   server.registerTool(
@@ -597,6 +676,8 @@ export async function main(): Promise<void> {
       },
     },
     async ({ response_format, ...input }) => {
+      // v2.17.0: identity forgery rejection (operator directive 2026-05-05).
+      verifyCallerIdentity(input.caller, server.server.getClientVersion());
       // v2.16.0: the durable session caller is always the petitioner,
       // never the relator. Older code used lead_peer as caller for some
       // operator-started unanimous jobs, which polluted audits with
@@ -1148,8 +1229,14 @@ export async function main(): Promise<void> {
         openWorldHint: false,
       },
     },
-    async ({ session_id, reason, new_task, new_initial_draft, new_caller, response_format }) =>
-      textResult(
+    async ({ session_id, reason, new_task, new_initial_draft, new_caller, response_format }) => {
+      // v2.17.0: identity forgery rejection (operator directive 2026-05-05).
+      // Skip when new_caller is undefined (orchestrator falls back to a
+      // sensible default); otherwise verify like the other handlers.
+      if (new_caller !== undefined) {
+        verifyCallerIdentity(new_caller, server.server.getClientVersion());
+      }
+      return textResult(
         runtime.orchestrator.store.contestVerdict({
           session_id,
           reason,
@@ -1158,7 +1245,8 @@ export async function main(): Promise<void> {
           new_caller,
         }),
         response_format,
-      ),
+      );
+    },
   );
 
   server.registerTool(

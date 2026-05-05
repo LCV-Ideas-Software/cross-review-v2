@@ -23,7 +23,12 @@ import { SWEEP_MIN_IDLE_MS } from "../src/core/session-store.js";
 import { parsePeerStatus } from "../src/core/status.js";
 import { PEERS } from "../src/core/types.js";
 import type { PeerResult } from "../src/core/types.js";
-import { SessionIdSchema, pruneCompletedJobs } from "../src/mcp/server.js";
+import {
+  SessionIdSchema,
+  getCallerCandidatesFromClientInfo,
+  pruneCompletedJobs,
+  verifyCallerIdentity,
+} from "../src/mcp/server.js";
 import type { JobStatus } from "../src/mcp/server.js";
 import { selectFromCandidates } from "../src/peers/model-selection.js";
 import { StubAdapter } from "../src/peers/stub.js";
@@ -3929,6 +3934,77 @@ assert.equal(Object.hasOwn(metrics.decision_quality, "undefined"), false);
   const noHint = classifyProviderError("codex", "openai", "gpt-5", generic, 1, Date.now());
   assert.equal(noHint.docs_hint, undefined, "generic 4xx must not synthesize docs_hint");
   console.log("[smoke] provider_4xx_param_rejection_docs_hint_test: PASS");
+}
+
+// v2.17.0: identity forgery rejection (operator directive 2026-05-05).
+// Validates verifyCallerIdentity() and getCallerCandidatesFromClientInfo()
+// across the 6 cases that close the 0994cbaf attack class:
+//  (1) declared caller matches clientInfo single-resolved → identity_verified=true
+//  (2) declared caller != clientInfo single-resolved → throws identity_forgery_blocked
+//  (3) declared caller + clientInfo unknown → identity_verified=false (legitimate override)
+//  (4) declared caller="operator" → identity_verified=false (no agent claim made)
+//  (5) declared caller != clientInfo multi-match → throws (cannot validate against ambiguous host)
+//  (6) empirical attack reproduction (Codex client + caller=claude → rejected)
+{
+  // (1) Match.
+  const verified = verifyCallerIdentity("claude", { name: "claude-code" });
+  assert.equal(verified.identity_verified, true);
+  assert.equal(verified.client_info_name, "claude-code");
+
+  // (2) Mismatch.
+  let threwForgery = false;
+  let forgeryMessage = "";
+  try {
+    verifyCallerIdentity("claude", { name: "codex-cli" });
+  } catch (err) {
+    threwForgery = true;
+    forgeryMessage = (err as Error).message;
+  }
+  assert.ok(threwForgery, "verifyCallerIdentity must throw on caller/clientInfo mismatch");
+  assert.match(forgeryMessage, /identity_forgery_blocked/);
+  assert.match(forgeryMessage, /contradicts clientInfo/);
+  assert.match(forgeryMessage, /codex/);
+  assert.match(forgeryMessage, /claude/);
+
+  // (3) Legitimate override (unknown clientInfo).
+  const override = verifyCallerIdentity("claude", { name: "headless-orchestrator-v9" });
+  assert.equal(override.identity_verified, false);
+  assert.equal(override.client_info_name, "headless-orchestrator-v9");
+
+  // (4) operator caller (no agent claim).
+  const operator = verifyCallerIdentity("operator", { name: "claude-code" });
+  assert.equal(operator.identity_verified, false);
+  assert.equal(operator.client_info_name, "claude-code");
+
+  // (5) Multi-match clientInfo while declaring an agent caller.
+  let threwMulti = false;
+  try {
+    verifyCallerIdentity("claude", { name: "claude-codex-bridge" });
+  } catch (err) {
+    threwMulti = true;
+    assert.match((err as Error).message, /identity_forgery_blocked/);
+    assert.match((err as Error).message, /multiple agents/);
+    assert.match((err as Error).message, /ambiguous client/);
+  }
+  assert.ok(threwMulti, "verifyCallerIdentity must throw on multi-match clientInfo");
+
+  // (6) Empirical attack reproduction (session 0994cbaf class).
+  let threwAttack = false;
+  try {
+    verifyCallerIdentity("claude", { name: "codex" });
+  } catch {
+    threwAttack = true;
+  }
+  assert.ok(
+    threwAttack,
+    "v2.17.0: empirical attack pattern (caller=claude from codex client) MUST be rejected",
+  );
+
+  // Helper directly: getCallerCandidatesFromClientInfo returns ARRAY.
+  const cands = getCallerCandidatesFromClientInfo({ name: "claude-codex-bridge" });
+  assert.deepEqual(cands.sort(), ["claude", "codex"]);
+
+  console.log("[smoke] identity_forgery_blocked_test: PASS");
 }
 
 // v2.6.1 NOTE: smoke coverage for `peer.fallback.budget_blocked` and

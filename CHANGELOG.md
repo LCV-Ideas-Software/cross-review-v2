@@ -9,6 +9,41 @@ standard `v00.00.00`; npm package versions remain SemVer.
 
 _No entries yet._
 
+## [v02.17.00] - 2026-05-05
+
+**HARD GATE — identity forgery rejection (operator directive 2026-05-05).** Pre-v2.17.0 the `caller` field on tool inputs was trusted unconditionally; v2 did not even capture `clientInfo` from the MCP initialize handshake. An agent (e.g. Codex CLI from the operator's terminal) could pass `caller="claude"` while its MCP client identified itself as "codex", impersonating Claude in tribunal sessions: self-excluding the real Claude from the panel while the impersonator stayed on the panel reviewing its own petition. **Empirical evidence**: cross-review-v2 session `0994cbaf-c270-4eaa-b42b-a0e638b9d1b6` (2026-05-05T05:30:10Z) was created by Codex with `caller=claude` for exactly this purpose.
+
+This is a **minor bump** (not patch) because the public surface adds a new error class (`identity_forgery_blocked`). Callers passing `caller` consistent with their `clientInfo.name` (or with an unknown clientInfo, or `caller="operator"`) continue to work unchanged; mismatched callers will start receiving errors.
+
+### Added
+
+- `getCallerCandidatesFromClientInfo(clientInfo)` exported from `src/mcp/server.ts`: returns ARRAY of `PeerId`s whose name appears as substring in lowercased `clientInfo.name`. Walks `PEERS` (claude/codex/gemini/deepseek/grok).
+- `verifyCallerIdentity(declaredCaller, clientInfo)` exported from `src/mcp/server.ts`: cross-checks the declared `caller` against the clientInfo-derived candidate set. Returns `{ identity_verified, client_info_name }` on success; throws `identity_forgery_blocked` on mismatch.
+
+### Changed
+
+- All tool handlers that accept `caller` now invoke `verifyCallerIdentity` against `server.server.getClientVersion()` BEFORE delegating to the orchestrator: `session_init`, `ask_peers`, `session_start_round`, `run_until_unanimous`, `session_start_unanimous`, and (when `new_caller` is provided) `contest_verdict`. Mismatch throws an explicit error that surfaces both the declared caller and the clientInfo-derived agent.
+
+### Decision rules
+
+| Declared `caller` | clientInfo resolves to      | Result                                                                           |
+| ----------------- | --------------------------- | -------------------------------------------------------------------------------- |
+| `operator`        | anything                    | OK — `identity_verified=false` (no agent claim made)                             |
+| Agent X           | nothing (unknown host)      | OK — `identity_verified=false` (legitimate override for headless/scripted hosts) |
+| Agent X           | exactly Agent X             | OK — `identity_verified=true`                                                    |
+| Agent X           | exactly Agent Y (Y ≠ X)     | **THROWS** `identity_forgery_blocked`                                            |
+| Agent X           | multiple agents (ambiguous) | **THROWS** `identity_forgery_blocked` (cannot validate against ambiguous host)   |
+
+### Smoke marker (1 new)
+
+- `identity_forgery_blocked_test` (in `scripts/smoke.ts`): 6 sub-cases covering all decision rows above plus the empirical attack reproduction (Codex client + caller=claude → rejected, closes the `0994cbaf` class) plus a direct test of `getCallerCandidatesFromClientInfo` returning the multi-match array correctly.
+
+### Operational notes
+
+- **Cross-review trilateral was bypassed for this ship** by explicit operator directive 2026-05-05. Same precedent as the one-time exception when cross-review-mcp itself is broken (`feedback_cross_review_self_repair_exception.md`): routing this security fix through the very gate it hardens would be circular.
+- **The `feedback_no_self_review_hard_rule.md` workspace HARD GATE** is the policy this enforces. Without identity verification, the no-self-review hard gate was structurally bypassable.
+- Coordinated ship with `cross-review-v1 v1.9.0` which closes the same gap on the v1 side.
+
 ## [v02.16.00] - 2026-05-05
 
 **Tribunal protocol repair, read-only operational doctor, Windows smoke closure,
