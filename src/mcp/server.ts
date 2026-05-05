@@ -219,6 +219,7 @@ const TOOL_NAMES = [
   "session_poll",
   "session_events",
   "session_metrics",
+  "session_doctor",
   "session_report",
   "session_check_convergence",
   "session_attach_evidence",
@@ -260,7 +261,7 @@ export async function main(): Promise<void> {
           publisher: "LCV Ideas & Software",
           version: VERSION,
           release_date: RELEASE_DATE,
-          sponsors_url: "https://cross-review-v2.lcv.app.br",
+          sponsors_url: "https://cross-review-v2.lcv.dev",
           transport: "stdio",
           api_only: true,
           cli_execution: false,
@@ -515,7 +516,7 @@ export async function main(): Promise<void> {
     {
       title: "Run Until Unanimous",
       description:
-        "Generate or revise a draft and continue real API peer-review rounds until unanimous READY or the configured max_rounds is reached. v2.11.0: when `caller` is set to a peer id (claude|codex|gemini|deepseek), the relator lottery activates: omit `lead_peer` to have the server randomly select a non-caller peer as relator (modeled on judicial colegiados), or supply an explicit `lead_peer` that is NOT the caller. An explicit `lead_peer === caller` is rejected at the server with `caller_cannot_be_lead_peer` — an agent never reviews itself (workspace HARD GATE).",
+        "Generate or revise a draft and continue real API peer-review rounds until unanimous READY or the configured max_rounds is reached. v2.11.0: when `caller` is set to a peer id (claude|codex|gemini|deepseek|grok), the relator lottery activates: omit `lead_peer` to have the server randomly select a non-caller peer as relator (modeled on judicial colegiados), or supply an explicit `lead_peer` that is NOT the caller. An explicit `lead_peer === caller` is rejected at the server with `caller_cannot_be_lead_peer` — an agent never reviews itself (workspace HARD GATE).",
       inputSchema: z
         .object({
           task: z.string().min(1).max(SCHEMA_TASK_MAX_CHARS),
@@ -596,12 +597,12 @@ export async function main(): Promise<void> {
       },
     },
     async ({ response_format, ...input }) => {
-      // v2.11.0: when caller is a peer id and lead_peer is omitted, the
-      // session is initialized with caller as the session caller (so
-      // session_init's caller field reflects the petitioner). Otherwise
-      // fall back to lead_peer (v2.10) or "operator" (no caller passed).
-      const initCaller =
-        input.caller !== "operator" ? input.caller : (input.lead_peer ?? "operator");
+      // v2.16.0: the durable session caller is always the petitioner,
+      // never the relator. Older code used lead_peer as caller for some
+      // operator-started unanimous jobs, which polluted audits with
+      // caller/lead conflation. Relator identity belongs in
+      // convergence_scope.lead_peer after runUntilUnanimous resolves it.
+      const initCaller = input.caller;
       const session = input.session_id
         ? runtime.orchestrator.store.read(input.session_id)
         : await runtime.orchestrator.initSession(input.task, initCaller, input.review_focus);
@@ -759,6 +760,29 @@ export async function main(): Promise<void> {
     },
     async ({ session_id, response_format }) =>
       textResult(runtime.orchestrator.store.metrics(session_id), response_format),
+  );
+
+  server.registerTool(
+    "session_doctor",
+    {
+      title: "Session Doctor",
+      description:
+        "Read-only operational audit across durable sessions: open/stale/blocked cases, legacy self-lead metadata, open evidence asks, Grok provider errors, and token-event noise. Does not modify sessions.",
+      inputSchema: z
+        .object({
+          limit: z.number().int().min(1).max(100).default(20),
+          response_format: ResponseFormatSchema,
+        })
+        .strict(),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ limit, response_format }) =>
+      textResult(runtime.orchestrator.store.sessionDoctor(limit), response_format),
   );
 
   server.registerTool(

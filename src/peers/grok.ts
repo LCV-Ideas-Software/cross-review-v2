@@ -7,8 +7,11 @@
 // gate. Only deltas:
 //   - `id = "grok"` (5th peer in PEERS as of v2.14.0)
 //   - `provider = "xai"`
-//   - default model `grok-4-latest` (operator-corrected; NOT grok-4.3)
-//   - auth via `XAI_API_KEY` (canonical) with `GROK_API_KEY` fallback
+//   - auth via canonical `GROK_API_KEY`
+//   - operator chooses the model through CROSS_REVIEW_GROK_MODEL:
+//       * grok-4-latest / grok-4.20 / grok-4.20-reasoning:
+//         xAI automatic reasoning; omit reasoning.effort
+//       * grok-4.20-multi-agent: explicit reasoning.effort supported
 //   - OpenAI client constructed with `baseURL: "https://api.x.ai/v1"`
 //
 // Copied from openai.ts rather than refactored into a shared base
@@ -65,14 +68,14 @@ function usageFromGrok(usage: GrokUsage | null | undefined): TokenUsage | undefi
   };
 }
 
-// v2.14.1 (operator directive 2026-05-04): per official xAI docs at
-// https://docs.x.ai/docs/guides/reasoning, only `grok-4.20-multi-agent`
-// accepts the `reasoning.effort` parameter. Other Grok-4 models
-// (grok-4.3, grok-4-1-fast, grok-4-latest aliased to those) reject it
-// with a 400. v2.14.0 initially used `grok-4-latest` and the request
-// included `reasoning.effort`, returning the rejection observed in the
-// ask_peers functional test of v2.14.0. v2.14.1 switches the default
-// model to `grok-4.20-multi-agent` so the reasoning channel works.
+// v2.16.0 clarification (operator directive 2026-05-05): per official
+// xAI docs at https://docs.x.ai/developers/model-capabilities/text/reasoning, only
+// `grok-4.20-multi-agent` accepts the `reasoning.effort` parameter.
+// Other Grok-4 models such as `grok-4-latest`, `grok-4.20`, and
+// `grok-4.20-reasoning` rely on xAI automatic reasoning and must not
+// receive the explicit field. The operator is free to choose either
+// model family; this adapter detects the configured model and shapes the
+// request body accordingly.
 //
 // Important semantic difference: on `grok-4.20-multi-agent`, the
 // `reasoning.effort` parameter controls **how many agents collaborate**
@@ -86,13 +89,12 @@ function grokEffort(value: AppConfig["reasoning_effort"][PeerId]): GrokReasoning
   return value === "max" ? "xhigh" : (value ?? "xhigh");
 }
 
-// v2.15.0 (operator directive 2026-05-04, item 6): per-model reasoning
-// capability detection. Per official xAI docs at
-// https://docs.x.ai/docs/guides/reasoning, only `grok-4.20-multi-agent`
-// accepts the `reasoning.effort` body field. Other Grok models
-// (grok-4.3, grok-4-1-fast, grok-4-latest aliased to those, grok-3,
-// grok-3-fast) reject it with a 400 BUT have automatic reasoning on
-// by design — the field is unnecessary for them.
+// v2.15.0/v2.16.0: per-model reasoning capability detection. Per
+// official xAI docs at https://docs.x.ai/developers/model-capabilities/text/reasoning, only
+// `grok-4.20-multi-agent` accepts the `reasoning.effort` body field.
+// Other Grok models (including `grok-4-latest`, `grok-4.20`, and
+// `grok-4.20-reasoning`) have automatic reasoning by design, so the
+// field is unnecessary and omitted.
 //
 // Pre-v2.15 the GrokAdapter unconditionally included
 // `reasoning: { effort }` in every body, locking the operator to

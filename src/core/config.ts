@@ -18,8 +18,8 @@ function expandHome(rawPath: string): string {
   return rawPath;
 }
 
-export const VERSION = "2.15.1";
-export const RELEASE_DATE = "2026-05-04";
+export const VERSION = "2.16.0";
+export const RELEASE_DATE = "2026-05-05";
 export const DEFAULT_MAX_OUTPUT_TOKENS = 20_000;
 const COST_RATE_ENV_PREFIX: Record<PeerId, string> = {
   codex: "CROSS_REVIEW_OPENAI",
@@ -188,10 +188,12 @@ export function loadConfig(): AppConfig {
       claude: envValue("CROSS_REVIEW_ANTHROPIC_MODEL") || "claude-opus-4-7",
       gemini: envValue("CROSS_REVIEW_GEMINI_MODEL") || "gemini-3.1-pro-preview",
       deepseek: envValue("CROSS_REVIEW_DEEPSEEK_MODEL") || "deepseek-v4-pro",
-      // v2.14.1: default switched to `grok-4.20-multi-agent` (operator
-      // directive 2026-05-04). xAI docs: only this model accepts the
-      // `reasoning.effort` parameter; `grok-4-latest`/`grok-4.3`/
-      // `grok-4-1-fast` reject it with a 400. See peers/grok.ts header.
+      // v2.16.0 clarification: operator may choose `grok-4-latest`,
+      // `grok-4.3`, `grok-4.20`, or `grok-4.20-reasoning` (xAI automatic
+      // reasoning; no reasoning.effort body field) or
+      // `grok-4.20-multi-agent` (explicit reasoning.effort supported) through
+      // CROSS_REVIEW_GROK_MODEL. The adapter detects the chosen model
+      // before deciding whether to send the reasoning field.
       grok: envValue("CROSS_REVIEW_GROK_MODEL") || "grok-4.20-multi-agent",
     },
     fallback_models: {

@@ -18,6 +18,8 @@ import type {
   PeerResult,
   RuntimeEvent,
   RuntimeMetrics,
+  SessionDoctorEntry,
+  SessionDoctorReport,
   SessionEvent,
   ReviewRound,
   ReviewStatus,
@@ -27,6 +29,7 @@ import type {
   ShadowJudgmentPeerStats,
   ShadowJudgmentRollup,
 } from "./types.js";
+import { PEERS } from "./types.js";
 import { mergeCost, mergeUsage } from "./cost.js";
 import { redact } from "../security/redact.js";
 
@@ -910,7 +913,7 @@ export class SessionStore {
     const byPeer: Partial<Record<PeerId, ShadowJudgmentPeerStats>> = {};
     let decisionsTotal = 0;
     let wouldPromoteTotal = 0;
-    const peerKnown: readonly PeerId[] = ["codex", "claude", "gemini", "deepseek"];
+    const peerKnown: readonly PeerId[] = PEERS;
     for (const session of sessions) {
       const events = this.readEvents(session.session_id);
       for (const event of events) {
@@ -1106,6 +1109,158 @@ export class SessionStore {
     };
   }
 
+  // v2.16.0: read-only operational doctor. This is intentionally a
+  // reporting surface, not a cleanup tool: it never finalizes, rewrites
+  // or deletes sessions. Operators use it after audits to see which
+  // sessions need human action and which records are legacy metadata
+  // artifacts (for example caller==lead_peer before the petitioner/
+  // relator split).
+  sessionDoctor(limit = 20): SessionDoctorReport {
+    const cappedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 20));
+    const sessions = this.list();
+    const openSessions: SessionDoctorEntry[] = [];
+    const staleSessions: SessionDoctorEntry[] = [];
+    const blockedSessions: SessionDoctorEntry[] = [];
+    const maxRoundsSessions: SessionDoctorEntry[] = [];
+    const selfLeadMetadata: SessionDoctorEntry[] = [];
+    const openEvidenceSessions: SessionDoctorEntry[] = [];
+    const grokProviderErrorSessions: SessionDoctorEntry[] = [];
+    const eventReadErrorSessions: SessionDoctorEntry[] = [];
+    let eventsTotal = 0;
+    let tokenDeltaEvents = 0;
+    let tokenCompletedEvents = 0;
+
+    const pushLimited = (target: SessionDoctorEntry[], entry: SessionDoctorEntry): void => {
+      if (target.length < cappedLimit) target.push(entry);
+    };
+
+    for (const session of sessions) {
+      const scope = session.convergence_scope;
+      const petitioner = scope?.petitioner ?? scope?.caller ?? session.caller;
+      const leadPeer = scope?.lead_peer;
+      const openEvidenceItems = (session.evidence_checklist ?? []).filter(
+        (item) => (item.status ?? "open") === "open",
+      ).length;
+      const grokProviderErrors = (session.failed_attempts ?? []).filter(
+        (failure) => failure.peer === "grok" && failure.failure_class === "provider_error",
+      ).length;
+      const entry: SessionDoctorEntry = {
+        session_id: session.session_id,
+        version: session.version,
+        caller: session.caller,
+        petitioner,
+        lead_peer: leadPeer,
+        outcome: session.outcome,
+        outcome_reason: session.outcome_reason,
+        health_state: session.convergence_health?.state,
+        health_detail: session.convergence_health?.detail,
+        rounds: session.rounds.length,
+        updated_at: session.updated_at,
+        ...(openEvidenceItems > 0 ? { open_evidence_items: openEvidenceItems } : {}),
+        ...(grokProviderErrors > 0 ? { grok_provider_errors: grokProviderErrors } : {}),
+      };
+
+      if (!session.outcome) pushLimited(openSessions, entry);
+      if (session.convergence_health?.state === "stale") pushLimited(staleSessions, entry);
+      if (session.convergence_health?.state === "blocked") pushLimited(blockedSessions, entry);
+      if (session.outcome === "max-rounds") pushLimited(maxRoundsSessions, entry);
+      if (petitioner && leadPeer && petitioner === leadPeer) pushLimited(selfLeadMetadata, entry);
+      if (openEvidenceItems > 0) pushLimited(openEvidenceSessions, entry);
+      if (grokProviderErrors > 0) pushLimited(grokProviderErrorSessions, entry);
+
+      let sessionEvents: SessionEvent[] = [];
+      try {
+        sessionEvents = this.readEvents(session.session_id);
+      } catch (error) {
+        entry.event_read_error = redact(error instanceof Error ? error.message : String(error));
+        pushLimited(eventReadErrorSessions, entry);
+      }
+
+      for (const event of sessionEvents) {
+        eventsTotal += 1;
+        if (event.type === "peer.token.delta") tokenDeltaEvents += 1;
+        if (event.type === "peer.token.completed") tokenCompletedEvents += 1;
+      }
+    }
+
+    const recommendations: string[] = [];
+    if (openSessions.length > 0) {
+      recommendations.push(
+        "Review open_sessions first; finalize, contest, cancel or explicitly continue each live case.",
+      );
+    }
+    if (selfLeadMetadata.length > 0) {
+      recommendations.push(
+        "Treat self_lead_metadata as legacy/protocol-drift evidence; do not rewrite historical records automatically.",
+      );
+    }
+    if (openEvidenceSessions.length > 0) {
+      recommendations.push(
+        "Address or explicitly terminal-mark open evidence checklist items before expecting convergence.",
+      );
+    }
+    if (grokProviderErrorSessions.length > 0) {
+      recommendations.push(
+        "Run a Grok-specific smoke/probe for sessions with grok provider errors before relying on Grok in release gates.",
+      );
+    }
+    if (eventReadErrorSessions.length > 0) {
+      recommendations.push(
+        "Inspect event_read_error_sessions manually; malformed events.ndjson records were skipped for doctor aggregation but not modified.",
+      );
+    }
+    if (eventsTotal > 0 && tokenDeltaEvents / eventsTotal > 0.5) {
+      recommendations.push(
+        "Token delta events dominate this corpus; increase CROSS_REVIEW_V2_TOKEN_DELTA_CHARS_THRESHOLD or disable token streaming for low-noise audits.",
+      );
+    }
+
+    return {
+      generated_at: now(),
+      scope: "all",
+      limit: cappedLimit,
+      totals: {
+        sessions: sessions.length,
+        open: sessions.filter((session) => !session.outcome).length,
+        stale: sessions.filter((session) => session.convergence_health?.state === "stale").length,
+        blocked: sessions.filter((session) => session.convergence_health?.state === "blocked")
+          .length,
+        max_rounds: sessions.filter((session) => session.outcome === "max-rounds").length,
+        self_lead_metadata: sessions.filter((session) => {
+          const scope = session.convergence_scope;
+          const petitioner = scope?.petitioner ?? scope?.caller ?? session.caller;
+          return Boolean(petitioner && scope?.lead_peer && petitioner === scope.lead_peer);
+        }).length,
+        open_evidence_sessions: sessions.filter((session) =>
+          (session.evidence_checklist ?? []).some((item) => (item.status ?? "open") === "open"),
+        ).length,
+        grok_provider_error_sessions: sessions.filter((session) =>
+          (session.failed_attempts ?? []).some(
+            (failure) => failure.peer === "grok" && failure.failure_class === "provider_error",
+          ),
+        ).length,
+        event_read_error_sessions: eventReadErrorSessions.length,
+      },
+      findings: {
+        open_sessions: openSessions,
+        stale_sessions: staleSessions,
+        blocked_sessions: blockedSessions,
+        max_rounds_sessions: maxRoundsSessions,
+        self_lead_metadata: selfLeadMetadata,
+        open_evidence_sessions: openEvidenceSessions,
+        grok_provider_error_sessions: grokProviderErrorSessions,
+        event_read_error_sessions: eventReadErrorSessions,
+      },
+      event_noise: {
+        events_total: eventsTotal,
+        token_delta_events: tokenDeltaEvents,
+        token_completed_events: tokenCompletedEvents,
+        token_delta_ratio: eventsTotal > 0 ? tokenDeltaEvents / eventsTotal : null,
+      },
+      recommendations,
+    };
+  }
+
   // v2.14.0 (item 1): compute precision/recall/F1 for the shadow judge
   // against empirical ground truth (whether peers raised the same ask
   // in a subsequent round). Walks events.ndjson per session, finds each
@@ -1118,7 +1273,7 @@ export class SessionStore {
     session_id?: string;
   }): JudgmentPrecisionReport {
     const sessions = opts?.session_id ? [this.read(opts.session_id)] : this.list();
-    const peerKnown: readonly PeerId[] = ["codex", "claude", "gemini", "deepseek"];
+    const peerKnown: readonly PeerId[] = PEERS;
     const byPeer: Partial<Record<PeerId, JudgmentPrecisionPeerStats>> = {};
     let totalDecisions = 0;
     let totalWithGroundTruth = 0;

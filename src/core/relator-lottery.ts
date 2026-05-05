@@ -48,7 +48,7 @@ export class CallerCannotBeLeadPeerError extends Error {
     super(
       `caller_cannot_be_lead_peer: ${caller} cannot review own submission. ` +
         `Submit without lead_peer to trigger automatic relator lottery, ` +
-        `or pick a different non-caller peer (codex|claude|gemini|deepseek).`,
+        `or pick a different non-caller peer (codex|claude|gemini|deepseek|grok).`,
     );
     this.name = "CallerCannotBeLeadPeerError";
   }

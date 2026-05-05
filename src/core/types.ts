@@ -1,9 +1,12 @@
 // v2.14.0 (item 5, operator directive 2026-05-04): Grok joined the
 // quarteto, making it a quinteto. Per `project_cross_review_v2_grok_integration_pending.md`,
 // xAI's Grok uses the OpenAI Responses API surface at base URL
-// `https://api.x.ai/v1`, default model `grok-4-latest`. Auth via
-// XAI_API_KEY (or GROK_API_KEY as fallback). Adapter at `peers/grok.ts`
-// inherits the same Responses API code path the OpenAI adapter uses.
+// `https://api.x.ai/v1`. Auth is via GROK_API_KEY. Operators may choose
+// `grok-4-latest` / `grok-4.3` (xAI automatic reasoning, no
+// reasoning.effort body field) or `grok-4.20-multi-agent` (explicit
+// reasoning.effort supported).
+// Adapter at `peers/grok.ts` inherits the same Responses API code path
+// the OpenAI adapter uses.
 export const PEERS = ["codex", "claude", "gemini", "deepseek", "grok"] as const;
 export type PeerId = (typeof PEERS)[number];
 
@@ -167,7 +170,15 @@ export interface InFlightRound {
 }
 
 export interface ConvergenceScope {
+  // Petitioner/impetrante: the caller that submitted the case. This is
+  // the canonical actor for the self-review prohibition.
+  petitioner?: PeerId | "operator";
   caller: PeerId | "operator";
+  // Actor currently presenting the draft/status for this round. In
+  // runUntilUnanimous this is usually the lead_peer; in direct ask_peers
+  // it is normally the same as caller. Kept separate so persisted audit
+  // state never has to pretend the relator is the petitioner.
+  acting_peer?: PeerId | "operator";
   caller_status: ReviewStatus;
   expected_peers: PeerId[];
   reviewer_peers: PeerId[];
@@ -678,4 +689,55 @@ export interface RuntimeMetrics {
   per_peer_health: Partial<Record<PeerId, PeerHealthSummary>>;
   // v2.12.0
   shadow_judgment: ShadowJudgmentRollup;
+}
+
+export interface SessionDoctorEntry {
+  session_id: string;
+  version?: string;
+  caller?: PeerId | "operator";
+  petitioner?: PeerId | "operator";
+  lead_peer?: PeerId;
+  outcome?: SessionOutcome;
+  outcome_reason?: string;
+  health_state?: ConvergenceHealth["state"];
+  health_detail?: string;
+  rounds: number;
+  updated_at: string;
+  open_evidence_items?: number;
+  grok_provider_errors?: number;
+  event_read_error?: string;
+}
+
+export interface SessionDoctorReport {
+  generated_at: string;
+  scope: "all";
+  limit: number;
+  totals: {
+    sessions: number;
+    open: number;
+    stale: number;
+    blocked: number;
+    max_rounds: number;
+    self_lead_metadata: number;
+    open_evidence_sessions: number;
+    grok_provider_error_sessions: number;
+    event_read_error_sessions: number;
+  };
+  findings: {
+    open_sessions: SessionDoctorEntry[];
+    stale_sessions: SessionDoctorEntry[];
+    blocked_sessions: SessionDoctorEntry[];
+    max_rounds_sessions: SessionDoctorEntry[];
+    self_lead_metadata: SessionDoctorEntry[];
+    open_evidence_sessions: SessionDoctorEntry[];
+    grok_provider_error_sessions: SessionDoctorEntry[];
+    event_read_error_sessions: SessionDoctorEntry[];
+  };
+  event_noise: {
+    events_total: number;
+    token_delta_events: number;
+    token_completed_events: number;
+    token_delta_ratio: number | null;
+  };
+  recommendations: string[];
 }

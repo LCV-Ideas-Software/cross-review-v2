@@ -95,7 +95,7 @@ const PROVIDER_DOCS_URLS: Record<string, string> = {
 // after the generic provider docs URL when a parameter rename is known.
 const PROVIDER_PARAM_DOCS: Record<string, Record<string, string>> = {
   xai: {
-    "reasoning.effort": "https://docs.x.ai/docs/guides/reasoning",
+    "reasoning.effort": "https://docs.x.ai/developers/model-capabilities/text/reasoning",
   },
   openai: {
     "reasoning.effort":

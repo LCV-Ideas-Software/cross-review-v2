@@ -5,7 +5,7 @@
 # cross-review-v2
 
 > MCP server orchestrating API-first cross-review between Claude, ChatGPT Codex,
-> Gemini, and DeepSeek with unanimous convergence gates.
+> Gemini, DeepSeek, and Grok with unanimous convergence gates.
 
 [![status: stable](https://img.shields.io/badge/status-stable-brightgreen.svg)](#status)
 [![npm](https://img.shields.io/npm/v/@lcv-ideas-software/cross-review-v2.svg)](https://www.npmjs.com/package/@lcv-ideas-software/cross-review-v2)
@@ -21,13 +21,14 @@ npm install -g @lcv-ideas-software/cross-review-v2
 npm install -g @lcv-ideas-software/cross-review-v2 --registry=https://npm.pkg.github.com
 ```
 
-**Status.** Stable. Current release: **v02.15.01** (npm package `2.15.1`). See
+**Status.** Stable. Current release: **v02.16.00** (npm package `2.16.0`). See
 [CHANGELOG.md](./CHANGELOG.md) for the release history.
 
 The version history at a glance:
 
 | Release | Scope |
 |---|---|
+| **`v02.16.00`** | **Tribunal protocol repair plus operational doctor.** Separates petitioner/caller from relator metadata, applies self-recusal to direct `ask_peers`, adds read-only `session_doctor`, fixes Windows smoke teardown, and refreshes provider model guidance from official docs. |
 | **`v02.15.01`** | **`server_info` consensus visibility hotfix.** Exposes `consensus_peers` and `configured_consensus_peers_raw` for evidence-judge autowire so operators can audit the same configuration the dispatcher is using. |
 | **`v02.15.00`** | **Backlog bundle for operational judge controls.** Added consensus-based judge autowire, per-call reasoning-effort overrides, opt-in real-API smoke, provider 4xx docs hints, and a Grok reasoning-capability allowlist while exposing consensus toggles across the six MCP host configs. |
 | **`v02.14.01`** | **Grok reasoning model hotfix.** Switched the default Grok model to `grok-4.20-multi-agent` after real xAI verification and official docs showed `reasoning.effort` is accepted only on that model family. |
@@ -63,7 +64,8 @@ The version history at a glance:
 
 `cross-review-v2` is the stable API-first implementation of the cross-review
 pattern. It orchestrates provider API clients (OpenAI/Codex, Anthropic/Claude,
-Google Gemini, and DeepSeek) and provides an MCP-compatible server surface.
+Google Gemini, DeepSeek, and xAI/Grok) and provides an MCP-compatible server
+surface.
 
 Runtime calls are real provider calls by default. Stubs exist only for smoke
 tests and CI when `CROSS_REVIEW_V2_STUB=1`.
@@ -72,6 +74,7 @@ tests and CI when `CROSS_REVIEW_V2_STUB=1`.
 - Anthropic TypeScript client library for Claude.
 - Google Gen AI client library for Gemini.
 - OpenAI-compatible DeepSeek API through the OpenAI client library.
+- OpenAI-compatible xAI Grok API through the OpenAI client library.
 
 ## Quick Start
 
@@ -81,6 +84,7 @@ tests and CI when `CROSS_REVIEW_V2_STUB=1`.
 [Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY", "<ANTHROPIC_API_KEY>", "User")
 [Environment]::SetEnvironmentVariable("GEMINI_API_KEY", "<GEMINI_API_KEY>", "User")
 [Environment]::SetEnvironmentVariable("DEEPSEEK_API_KEY", "<DEEPSEEK_API_KEY>", "User")
+[Environment]::SetEnvironmentVariable("GROK_API_KEY", "<GROK_API_KEY>", "User")
 ```
 
 Restart your terminal after changing environment variables.
@@ -108,7 +112,15 @@ variables. Example overrides (PowerShell):
 ```powershell
 [Environment]::SetEnvironmentVariable("CROSS_REVIEW_OPENAI_MODEL", "gpt-5.5", "User")
 [Environment]::SetEnvironmentVariable("CROSS_REVIEW_OPENAI_REASONING_EFFORT", "xhigh", "User")
+[Environment]::SetEnvironmentVariable("CROSS_REVIEW_GROK_MODEL", "grok-4.20-multi-agent", "User")
+[Environment]::SetEnvironmentVariable("CROSS_REVIEW_GROK_REASONING_EFFORT", "xhigh", "User")
 ```
+
+For Grok, `GROK_API_KEY` is canonical. `grok-4-latest`, `grok-4.3`,
+`grok-4.20`, and `grok-4.20-reasoning` use xAI automatic reasoning without an explicit
+`reasoning.effort` field. `grok-4.20-multi-agent` accepts explicit
+`reasoning.effort`; `low`/`medium` select 4 agents and `high`/`xhigh` select
+16 agents.
 
 Financial and budget controls are required for paid provider calls. Configure
 these environment variables before running real sessions (example):
@@ -136,6 +148,7 @@ these environment variables before running real sessions (example):
 - `session_poll`
 - `session_events`
 - `session_metrics`
+- `session_doctor`
 - `session_report`
 - `session_check_convergence`
 - `session_attach_evidence`

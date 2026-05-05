@@ -27,7 +27,7 @@ import { missingFinancialControlVars } from "./config.js";
 import { classifyProviderError } from "../peers/errors.js";
 import { resolveBestModels } from "../peers/model-selection.js";
 import { createAdapters, selectAdapters } from "../peers/registry.js";
-import { resolveLeadPeer } from "./relator-lottery.js";
+import { assertLeadPeerNotCaller, resolveLeadPeer } from "./relator-lottery.js";
 import { redact } from "../security/redact.js";
 
 export interface AskPeersInput {
@@ -35,7 +35,12 @@ export interface AskPeersInput {
   task: string;
   review_focus?: string;
   draft: string;
+  // Petitioner/impetrante that submitted the case. Internal callers such
+  // as runUntilUnanimous use this to keep the original caller distinct
+  // from the relator currently presenting a revised draft.
+  petitioner?: PeerId | "operator";
   caller?: PeerId | "operator";
+  lead_peer?: PeerId;
   caller_status?: ReviewStatus;
   peers?: PeerId[];
   signal?: AbortSignal;
@@ -1719,7 +1724,8 @@ export class CrossReviewOrchestrator {
   }
 
   async askPeers(input: AskPeersInput): Promise<AskPeersOutput> {
-    const caller = input.caller ?? "operator";
+    const actingPeer = input.caller ?? "operator";
+    const requestedPetitioner = input.petitioner ?? actingPeer;
     const callerStatus = input.caller_status ?? "READY";
     // v2.14.0 (operator directive 2026-05-04): explicit `peers` entries
     // referencing a runtime-disabled peer are hard-rejected. Without an
@@ -1732,29 +1738,48 @@ export class CrossReviewOrchestrator {
         if (!this.config.peer_enabled[peer]) throw new PeerDisabledError(peer);
       }
     }
-    const selectedPeers = requestedPeers.filter((peer) => this.config.peer_enabled[peer]);
+    const enabledRequestedPeers = requestedPeers.filter((peer) => this.config.peer_enabled[peer]);
+    // Tribunal-colegiado hard gate: the petitioner/caller never votes as
+    // a reviewer on their own petition. Direct ask_peers has no relator
+    // unless the caller explicitly supplies one through the internal API,
+    // but it still must auto-recuse the petitioner from the reviewer set.
+    const selectedPeers =
+      requestedPetitioner === "operator"
+        ? enabledRequestedPeers
+        : enabledRequestedPeers.filter((peer) => peer !== requestedPetitioner);
+    if (input.lead_peer !== undefined) {
+      assertLeadPeerNotCaller(requestedPetitioner, input.lead_peer);
+    }
+    if (!selectedPeers.length) {
+      throw new Error(
+        `no_eligible_reviewer_peers: caller=${requestedPetitioner} left no reviewer peers after auto-recusal. Add at least one non-caller peer.`,
+      );
+    }
     const missingFinancialVars = missingFinancialControlVars(this.config, selectedPeers);
     const session = input.session_id
       ? this.store.read(input.session_id)
       : missingFinancialVars.length
         ? this.store.init(
             input.task,
-            caller,
+            requestedPetitioner,
             [],
             normalizeReviewFocus(input.review_focus, this.config),
           )
-        : await this.initSession(input.task, caller, input.review_focus);
+        : await this.initSession(input.task, requestedPetitioner, input.review_focus);
+    const petitioner = input.petitioner ?? session.convergence_scope?.petitioner ?? session.caller;
     const roundNumber = session.rounds.length + 1;
     const startedAt = now();
     const quorumPeers = resolveQuorumPeers(session, selectedPeers);
     const isRecoveryRound = quorumPeers.length > selectedPeers.length;
     const adapters = createAdapters(this.config);
     const convergenceScope: ConvergenceScope = {
-      caller,
+      petitioner,
+      caller: petitioner,
+      acting_peer: actingPeer,
       caller_status: callerStatus,
       expected_peers: quorumPeers,
       reviewer_peers: selectedPeers,
-      lead_peer: caller === "operator" ? undefined : caller,
+      ...(input.lead_peer ? { lead_peer: input.lead_peer } : {}),
     };
     const draftFile = this.store.saveDraft(session.session_id, roundNumber, input.draft);
     // v2.14.0 (path-A structural fix): resolve session-attached evidence
@@ -2491,7 +2516,7 @@ export class CrossReviewOrchestrator {
         ? this.store.read(input.session_id)
         : this.store.init(
             input.task,
-            leadPeer,
+            callerForLottery,
             [],
             normalizeReviewFocus(input.review_focus, this.config),
           );
@@ -2511,7 +2536,7 @@ export class CrossReviewOrchestrator {
     }
     let session = input.session_id
       ? this.store.read(input.session_id)
-      : await this.initSession(input.task, leadPeer, input.review_focus);
+      : await this.initSession(input.task, callerForLottery, input.review_focus);
     const adapters = createAdapters(this.config);
     const reviewerPeers = selectedPeers.filter((peer) => peer !== leadPeer);
     let draft = input.initial_draft;
@@ -2605,7 +2630,9 @@ export class CrossReviewOrchestrator {
         session_id: session.session_id,
         task: input.task,
         draft,
+        petitioner: callerForLottery,
         caller: leadPeer,
+        lead_peer: leadPeer,
         caller_status: "READY",
         peers: reviewerPeers.length ? reviewerPeers : selectedPeers,
         review_focus: input.review_focus,

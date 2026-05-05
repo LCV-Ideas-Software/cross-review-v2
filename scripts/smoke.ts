@@ -213,6 +213,21 @@ for (const deprecatedOrWeakModel of [
     `${deprecatedOrWeakModel} must not be in active priority lists`,
   );
 }
+for (const currentOfficialModel of [
+  "gpt-5.5",
+  "claude-opus-4-7",
+  "gemini-3.1-pro-preview",
+  "deepseek-v4-pro",
+  "grok-4.20-multi-agent",
+  "grok-4.3",
+  "grok-4.20-reasoning",
+  "grok-4-latest",
+]) {
+  assert.ok(
+    modelSelectionSource.includes(`"${currentOfficialModel}"`),
+    `${currentOfficialModel} must remain in the official-doc-backed priority lists`,
+  );
+}
 
 const noWeakDowngrade = selectFromCandidates(
   "claude",
@@ -804,6 +819,64 @@ const metrics = orchestrator.store.metrics();
 assert.equal(metrics.fallback_events, 1);
 assert.equal((metrics.peer_failures.cancelled ?? 0) >= 1, true);
 assert.equal(Object.hasOwn(metrics.decision_quality, "undefined"), false);
+
+// v2.16.0: sessionDoctor is a read-only operational surface. It must
+// report problematic sessions and token-event noise without finalizing,
+// deleting or rewriting anything.
+{
+  const { SessionStore } = await import("../src/core/session-store.js");
+  const doctorStore = new SessionStore({
+    ...config,
+    data_dir: smokeTmpDir("session-doctor"),
+  });
+  const doctorSession = doctorStore.init("doctor self-lead legacy fixture", "claude", []);
+  doctorStore.markInFlight(doctorSession.session_id, {
+    round: 1,
+    peers: ["codex"],
+    started_at: new Date().toISOString(),
+    scope: {
+      petitioner: "claude",
+      caller: "claude",
+      acting_peer: "claude",
+      caller_status: "READY",
+      expected_peers: ["codex"],
+      reviewer_peers: ["codex"],
+      lead_peer: "claude",
+    },
+  });
+  doctorStore.appendEvent({
+    type: "peer.token.delta",
+    session_id: doctorSession.session_id,
+    round: 1,
+    peer: "codex",
+    data: { chars: 12 },
+  });
+  doctorStore.appendEvent({
+    type: "peer.token.completed",
+    session_id: doctorSession.session_id,
+    round: 1,
+    peer: "codex",
+    data: { chars: 12 },
+  });
+  const malformedSession = doctorStore.init("doctor malformed events fixture", "operator", []);
+  fs.writeFileSync(doctorStore.eventsPath(malformedSession.session_id), "{bad-json\n", "utf8");
+  const doctor = doctorStore.sessionDoctor(5);
+  assert.equal(doctor.totals.sessions, 2);
+  assert.equal(doctor.totals.open, 2);
+  assert.equal(doctor.totals.self_lead_metadata, 1);
+  assert.equal(doctor.totals.event_read_error_sessions, 1);
+  assert.ok(
+    doctor.findings.open_sessions.some((entry) => entry.session_id === doctorSession.session_id),
+  );
+  assert.equal(doctor.findings.self_lead_metadata[0]?.lead_peer, "claude");
+  assert.equal(
+    doctor.findings.event_read_error_sessions[0]?.session_id,
+    malformedSession.session_id,
+  );
+  assert.equal(doctor.event_noise.token_delta_events, 1);
+  assert.equal(doctorStore.read(doctorSession.session_id).outcome, undefined);
+  console.log("[smoke] session_doctor_readonly_findings_test: PASS");
+}
 
 // v2.4.0 / cross-review-v2 R2 (codex): SessionIdSchema lowercase
 // normalization. Verify that the schema (a) accepts uppercase UUIDv4,
@@ -2646,6 +2719,74 @@ assert.equal(Object.hasOwn(metrics.decision_quality, "undefined"), false);
   console.log("[smoke] relator_auto_recusal_filters_session_peers_test: PASS");
 }
 
+// v2.16.0 — ask_peers also obeys the self-review prohibition.
+// Direct ask_peers calls have no relator by default, but the caller is
+// still the petitioner and must be auto-recused from reviewer_peers.
+{
+  const cfg = {
+    ...loadConfig(),
+    data_dir: smokeTmpDir("ask-peers-recusal"),
+    budget: {
+      ...loadConfig().budget,
+      max_session_cost_usd: 10000,
+      preflight_max_round_cost_usd: 10000,
+      until_stopped_max_cost_usd: 10000,
+    },
+  };
+  const orch = new CrossReviewOrchestrator(cfg, () => {});
+  const out = await orch.askPeers({
+    task: "Direct ask_peers auto-recusal smoke",
+    draft: "Test draft.",
+    caller: "claude",
+    peers: ["claude", "codex"],
+  });
+  assert.deepEqual(
+    out.round.peers.map((peer) => peer.peer),
+    ["codex"],
+    "askPeers must remove caller from reviewer_peers",
+  );
+  const scope = out.session.convergence_scope;
+  assert.equal(scope?.caller, "claude");
+  assert.equal(scope?.petitioner, "claude");
+  assert.equal(scope?.acting_peer, "claude");
+  assert.equal(scope?.lead_peer, undefined, "direct ask_peers must not synthesize lead_peer");
+  assert.deepEqual(scope?.reviewer_peers, ["codex"]);
+  console.log("[smoke] ask_peers_auto_recusal_persisted_scope_test: PASS");
+}
+
+// v2.16.0 — run_until_unanimous persists petitioner != lead_peer.
+// The lead may act on a round, but durable audit metadata must keep the
+// impetrante/caller distinct from the relator.
+{
+  const cfg = {
+    ...loadConfig(),
+    data_dir: smokeTmpDir("run-until-petitioner-scope"),
+    budget: {
+      ...loadConfig().budget,
+      max_session_cost_usd: 10000,
+      preflight_max_round_cost_usd: 10000,
+      until_stopped_max_cost_usd: 10000,
+    },
+  };
+  const orch = new CrossReviewOrchestrator(cfg, () => {});
+  const out = await orch.runUntilUnanimous({
+    task: "Petitioner/relator split smoke",
+    initial_draft: "Test draft.",
+    caller: "claude",
+    lead_peer: "codex",
+    peers: ["codex", "gemini"],
+    max_rounds: 1,
+  });
+  const scope = out.session.convergence_scope;
+  assert.equal(out.session.caller, "claude");
+  assert.equal(scope?.caller, "claude");
+  assert.equal(scope?.petitioner, "claude");
+  assert.equal(scope?.acting_peer, "codex");
+  assert.equal(scope?.lead_peer, "codex");
+  assert.notEqual(scope?.caller, scope?.lead_peer);
+  console.log("[smoke] run_until_persists_petitioner_not_lead_test: PASS");
+}
+
 // v2.12.0 — config + server_info expose evidence_judge_autowire fields.
 // AppConfig.evidence_judge_autowire is the single source of truth read by
 // the boot notice, the orchestrator, and server_info. Verify the parser
@@ -3651,6 +3792,8 @@ assert.equal(Object.hasOwn(metrics.decision_quality, "undefined"), false);
   // Allowlist contract: only grok-4.20-multi-agent.
   assert.equal(modelAcceptsReasoningEffort("grok-4.20-multi-agent"), true);
   assert.equal(modelAcceptsReasoningEffort("grok-4-latest"), false);
+  assert.equal(modelAcceptsReasoningEffort("grok-4.20-reasoning"), false);
+  assert.equal(modelAcceptsReasoningEffort("grok-4.20"), false);
   assert.equal(modelAcceptsReasoningEffort("grok-4.3"), false);
   assert.equal(modelAcceptsReasoningEffort("grok-4-1-fast"), false);
   assert.equal(modelAcceptsReasoningEffort("grok-3"), false);
@@ -3772,8 +3915,8 @@ assert.equal(Object.hasOwn(metrics.decision_quality, "undefined"), false);
   assert.equal(failure.docs_hint?.parameter, "reasoning.effort");
   assert.equal(
     failure.docs_hint?.docs_url,
-    "https://docs.x.ai/docs/guides/reasoning",
-    "xAI reasoning.effort must point to guides/reasoning",
+    "https://docs.x.ai/developers/model-capabilities/text/reasoning",
+    "xAI reasoning.effort must point to the official reasoning capability docs",
   );
   assert.match(
     failure.reformulation_advice ?? "",
@@ -3804,15 +3947,30 @@ assert.equal(Object.hasOwn(metrics.decision_quality, "undefined"), false);
 // estimates due to retries/streaming/early-stop. Code review of
 // `orchestrator.ts:callPeerForReview` validates the gate logic.
 
-console.log(
-  JSON.stringify(
-    {
-      ok: true,
-      session_id: result.session.session_id,
-      data_dir: config.data_dir,
-      events: events.length,
-    },
-    null,
-    2,
-  ),
-);
+const smokeResult = {
+  ok: true,
+  session_id: result.session.session_id,
+  data_dir: config.data_dir,
+  events: events.length,
+};
+console.log(JSON.stringify(smokeResult, null, 2));
+
+// v2.16.0: Windows/tsx smoke teardown. The suite can finish every
+// assertion and emit ok:true while opaque SDK/tsx handles keep the Node
+// event loop alive. That makes local `npm test` depend on an external
+// timeout even though the functional verdict is already known. Dump
+// active handles only when explicitly requested, then exit on the next
+// turn of the event loop so stdout/stderr flush naturally.
+if (process.env.CROSS_REVIEW_V2_SMOKE_DUMP_HANDLES === "1") {
+  const activeHandles = (
+    process as typeof process & {
+      _getActiveHandles?: () => Array<{ constructor?: { name?: string } }>;
+    }
+  )._getActiveHandles?.();
+  console.error(
+    "[smoke] active handles after assertions:",
+    JSON.stringify(activeHandles?.map((handle) => handle.constructor?.name ?? "unknown") ?? []),
+  );
+}
+
+setImmediate(() => process.exit(0));

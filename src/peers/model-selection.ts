@@ -7,8 +7,8 @@ const DOCS = {
   codex: "https://developers.openai.com/api/docs/guides/latest-model",
   claude: "https://platform.claude.com/docs/en/about-claude/models/overview",
   gemini: "https://ai.google.dev/gemini-api/docs/models",
-  deepseek: "https://api-docs.deepseek.com/quick_start/pricing",
-  grok: "https://docs.x.ai/developers/models",
+  deepseek: "https://api-docs.deepseek.com/updates",
+  grok: "https://docs.x.ai/developers/model-capabilities/text/reasoning",
 } satisfies Record<PeerId, string>;
 
 const PRIORITY: Record<PeerId, string[]> = {
@@ -25,12 +25,23 @@ const PRIORITY: Record<PeerId, string[]> = {
   claude: ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"],
   gemini: ["gemini-3.1-pro-preview", "gemini-2.5-pro"],
   deepseek: ["deepseek-v4-pro", "deepseek-v4-flash"],
-  // v2.14.1: Grok priority list reordered. `grok-4.20-multi-agent`
-  // promoted to head because it is the only Grok-4 model that accepts
-  // the `reasoning.effort` parameter (per xAI docs). Other Grok-4
-  // variants (4.3, 4-1-fast, 4-latest) follow but trigger a 400 when
-  // the body includes reasoning_effort — the adapter has to know.
-  grok: ["grok-4.20-multi-agent", "grok-4-latest", "grok-4", "grok-3-fast", "grok-3"],
+  // v2.16.0 official-doc refresh (2026-05-05): xAI's reasoning docs
+  // distinguish automatic-reasoning Grok models from the explicit
+  // multi-agent model. `grok-4.20-multi-agent` remains first because it
+  // accepts `reasoning.effort`; `grok-4-latest` / `grok-4.3` /
+  // `grok-4.20-reasoning` / `grok-4.20` follow and must omit the
+  // explicit reasoning field.
+  grok: [
+    "grok-4.20-multi-agent",
+    "grok-4-latest",
+    "grok-4.3",
+    "grok-4.20-reasoning",
+    "grok-4.20",
+    "grok-4-1-fast",
+    "grok-4",
+    "grok-3-fast",
+    "grok-3",
+  ],
 };
 
 function envOverrideName(peer: PeerId): string {

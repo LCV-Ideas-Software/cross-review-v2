@@ -9,6 +9,88 @@ standard `v00.00.00`; npm package versions remain SemVer.
 
 _No entries yet._
 
+## [v02.16.00] - 2026-05-05
+
+**Tribunal protocol repair, read-only operational doctor, Windows smoke closure,
+and official provider-doc refresh.** This release repairs the audit semantics
+identified in the live session/log corpus: a petitioner/caller could still be
+persisted as `lead_peer` in direct `ask_peers` metadata, and synchronous
+`run_until_unanimous` initialized new sessions with the relator as the durable
+caller. The runtime now keeps the impetrante/petitioner separate from the
+relator/acting peer, auto-recuses peer callers from direct review rounds, and
+adds a read-only doctor surface for open/stale/blocked sessions without deleting
+or finalizing historical records.
+
+### Fixed
+
+- `ask_peers` no longer synthesizes `convergence_scope.lead_peer = caller`.
+  Direct ask-peers rounds have no relator unless an internal caller supplies a
+  real `lead_peer`; the persisted scope records `petitioner`, canonical
+  `caller`, and `acting_peer` separately.
+- Direct `ask_peers` now auto-recuses peer callers from `reviewer_peers` just
+  like `run_until_unanimous`, so an agent cannot vote on its own petition.
+- Synchronous `run_until_unanimous` initializes new sessions with the original
+  petitioner/caller, not the selected relator. Internal rounds still use the
+  relator as `acting_peer`, with `lead_peer` stored separately.
+- `session_start_unanimous` follows the same durable caller rule: session
+  caller is always the petitioner, never a fallback relator.
+- `scripts/smoke.ts` now exits explicitly after all assertions and `ok:true`
+  are emitted, with optional `CROSS_REVIEW_V2_SMOKE_DUMP_HANDLES=1` diagnostics.
+  This closes the Windows local-test hang where assertions passed but opaque
+  handles kept `npm run smoke` / `npm test` alive until timeout.
+
+### Added
+
+- New MCP tool `session_doctor`: read-only operational audit over durable
+  sessions. It reports open/stale/blocked/max-rounds sessions, legacy
+  self-lead metadata, open evidence asks, Grok provider-error sessions, and
+  token-event noise. Malformed `events.ndjson` files are reported as
+  `event_read_error_sessions` and skipped for aggregation without being
+  modified. It never mutates, finalizes, deletes, or rewrites sessions.
+- `SessionStore.sessionDoctor(limit)` and new `SessionDoctorReport` /
+  `SessionDoctorEntry` types.
+- Smoke markers:
+  - `ask_peers_auto_recusal_persisted_scope_test`
+  - `run_until_persists_petitioner_not_lead_test`
+  - `session_doctor_readonly_findings_test`
+- Official provider-doc refresh report:
+  `docs/reports/cross-review-v2-official-provider-docs-refresh-2026-05-05.md`.
+
+### Changed
+
+- Grok model guidance now reflects the official xAI split:
+  `grok-4.20-multi-agent` accepts explicit `reasoning.effort`
+  (`low`/`medium` = 4 agents, `high`/`xhigh` = 16 agents), while
+  `grok-4-latest`, `grok-4.20`, `grok-4.20-reasoning`, and related automatic
+  reasoning models omit that field.
+- Grok model priority list now keeps the explicit multi-agent model first while
+  reflecting current xAI general/reasoning guidance:
+  `grok-4.20-multi-agent > grok-4-latest > grok-4.3 >
+grok-4.20-reasoning > grok-4.20 > grok-4-1-fast > grok-4 > grok-3-fast >
+grok-3`.
+- `docs/model-selection.md` now records the 2026-05-05 official-doc check for
+  OpenAI, Anthropic, Gemini, DeepSeek, and xAI.
+- `server_info.sponsors_url` now matches the package homepage domain
+  `https://cross-review-v2.lcv.dev`.
+- README now lists `GROK_API_KEY`, Grok configuration examples, and
+  `session_doctor`.
+
+### Validation
+
+- Official documentation refresh for OpenAI, Anthropic, Google Gemini,
+  DeepSeek, and xAI/Grok.
+- `npm run format:check`
+- `git diff --check`
+- `npm run lint`
+- `npm run typecheck`
+- `npm run smoke` (Windows, exits 0)
+- `npm test` (build + smoke + runtime-smoke, exits 0)
+- `npm run runtime-default-smoke` (opt-in script skipped because
+  `CROSS_REVIEW_V2_REAL_API_SMOKE` is unset)
+- `npm audit --audit-level=moderate` (0 vulnerabilities)
+- `npm pack --dry-run --json` (105 files, package
+  `@lcv-ideas-software/cross-review-v2@2.16.0`)
+
 ## [v02.15.01] - 2026-05-04
 
 **Hotfix: `server_info` surfaces `consensus_peers` + `configured_consensus_peers_raw`.** v2.15.0 added the multi-peer judge consensus parser to `AppConfig.evidence_judge_autowire` and wired the dispatcher to honor `consensus_peers >= 2` correctly, but the `server_info` MCP tool handler at `src/mcp/server.ts:292` only serialized the v2.12.0 fields (`mode`, `peer`, `active`, `max_items_per_pass`, `configured_mode_raw`, `configured_peer_raw`). Operators setting `CROSS_REVIEW_V2_EVIDENCE_JUDGE_AUTOWIRE_CONSENSUS_PEERS` saw no evidence of the configuration in `server_info` even though the dispatch path was using it — silent visibility regression caught when the operator inspected `server_info` after configuring 6 MCP hosts with per-host consensus peer lists.
