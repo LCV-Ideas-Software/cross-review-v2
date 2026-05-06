@@ -21,7 +21,7 @@ npm install -g @lcv-ideas-software/cross-review-v2
 npm install -g @lcv-ideas-software/cross-review-v2 --registry=https://npm.pkg.github.com
 ```
 
-**Status.** Stable. Current release: **v02.18.00** (npm package `2.18.0`). See
+**Status.** Stable. Current release: **v02.18.01** (npm package `2.18.1`). See
 [CHANGELOG.md](./CHANGELOG.md) for the release history.
 
 The version history at a glance:

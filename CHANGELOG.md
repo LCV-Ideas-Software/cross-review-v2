@@ -9,6 +9,16 @@ standard `v00.00.00`; npm package versions remain SemVer.
 
 _No entries yet._
 
+## [v02.18.01] - 2026-05-05
+
+**Hotfix: closes Dependabot security advisory GHSA-v2v4-37r5-5v8g (medium severity) — `ip-address` XSS in Address6 HTML-emitting methods.** Pre-v2.18.1 the transitive dependency chain `@modelcontextprotocol/sdk@1.29.0 → express-rate-limit@8.4.1 → ip-address@10.1.0` pinned a vulnerable version (also pulled in via `@google/genai@1.52.0 → express-rate-limit@8.4.1`). The exploitability in this codebase is essentially zero (we don't use Address6 HTML-emitting methods, and we don't run the MCP HTTP transport — peers are API-first), but the advisory still surfaces in any `npm audit` and in dependabot. Dependabot's automatic update workflow (#14, run 25409531881) could not resolve the chain because the parent packages don't yet ship a bumped requirement, so dependabot reported "No patched version available for ip-address" and failed.
+
+Fix: added `overrides: { "ip-address": ">=10.1.1" }` to `package.json`. npm resolves the override regardless of transitive parents' constraints; the new install pulls a patched version (`>=10.1.1`, currently resolved to `10.2.0` in `package-lock.json`) which is past the vulnerable range. **Patch bump** because no public surface changed. Coordinated with cross-review-v1 v1.11.1 (same root cause, same fix).
+
+### Fixed
+
+- `package.json` `overrides.ip-address` pinned to `>=10.1.1` to close GHSA-v2v4-37r5-5v8g (Dependabot alert #1, medium severity). Also unblocks the failed Dependabot Updates run #14 (operator-flagged 2026-05-05).
+
 ## [v02.18.00] - 2026-05-05
 
 **Closes F1 from the v2 backlog: caller capability tokens.** Cryptographic identity proof complementing the v2.17.0 clientInfo gate. Pre-v2.18.0 the v2.17.0 cross-check between declared `caller` and `clientInfo.name` only catches _inconsistent_ self-reports — both fields are declared by the caller. An attacker that lies consistently in both passes the gate. F1 introduces a per-host secret (env var `CROSS_REVIEW_CALLER_TOKEN`), authoritative on match and rejected on mismatch. Coordinated ship with cross-review-v1 v1.11.0 (same scope, same env var names, same operator workflow).
