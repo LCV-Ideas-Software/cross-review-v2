@@ -20,6 +20,7 @@
 //   3. regenerate_caller_tokens MCP tool ships in v2.18.0.
 //   4. Ship permissive: CROSS_REVIEW_REQUIRE_TOKEN remains opt-in.
 
+import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -239,7 +240,29 @@ export function getParentProcessSnapshot(): ParentProcessSnapshot {
     parent_pid: typeof process.ppid === "number" ? process.ppid : null,
     parent_exe_basename: null,
   };
-  if (snapshot.parent_pid && process.platform !== "win32") {
+  if (!snapshot.parent_pid) return snapshot;
+  if (process.platform === "win32") {
+    // Windows path (added v2.18.2 / Tier 5): shell out to `tasklist` and
+    // parse the leading quoted CSV field. Best-effort, time-bounded 500ms,
+    // never throws. "PID not found" output starts with INFO/INFORMAÇÕES
+    // (no leading quote) so we use that as a discriminator.
+    try {
+      const r = spawnSync(
+        "tasklist",
+        ["/FI", `PID eq ${snapshot.parent_pid}`, "/FO", "CSV", "/NH"],
+        { encoding: "utf8", timeout: 500, windowsHide: true },
+      );
+      const stdout = String(r.stdout || "").trim();
+      if (stdout.startsWith('"')) {
+        const m = stdout.match(/^"([^"]+)"/);
+        if (m && m[1].length > 0 && m[1].length < 128) {
+          snapshot.parent_exe_basename = m[1];
+        }
+      }
+    } catch {
+      /* best-effort */
+    }
+  } else {
     try {
       const comm = fs.readFileSync(`/proc/${snapshot.parent_pid}/comm`, "utf8").trim();
       if (comm.length > 0 && comm.length < 128) {

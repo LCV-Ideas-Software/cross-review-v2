@@ -4162,9 +4162,42 @@ assert.equal(Object.hasOwn(metrics.decision_quality, "undefined"), false);
   assert.notEqual(r3?.map.claude, r1?.map.claude, "claude token rotates");
 
   // (14) getParentProcessSnapshot is best-effort, never throws.
+  // v2.18.2 / Tier 5: extended to assert Windows-path behavior. Pre-v2.18.2
+  // parent_exe_basename was always null on Windows (POSIX-only reader).
+  // v2.18.2 adds a `tasklist /FI "PID eq <ppid>" /FO CSV /NH` fallback.
   const snap = f1.getParentProcessSnapshot();
   assert.ok(snap !== null && typeof snap === "object");
   assert.ok("parent_pid" in snap && "parent_exe_basename" in snap);
+  assert.ok(
+    snap.parent_pid === null || (typeof snap.parent_pid === "number" && snap.parent_pid > 0),
+    "parent_pid is null or positive integer",
+  );
+  assert.ok(
+    snap.parent_exe_basename === null ||
+      (typeof snap.parent_exe_basename === "string" &&
+        snap.parent_exe_basename.length > 0 &&
+        snap.parent_exe_basename.length < 128),
+    "parent_exe_basename is null or sane string",
+  );
+  if (process.platform === "win32" && snap.parent_pid) {
+    assert.ok(
+      typeof snap.parent_exe_basename === "string" && snap.parent_exe_basename.length > 0,
+      `v2.18.2 Tier 5: on Windows with valid parent_pid=${snap.parent_pid}, parent_exe_basename should be populated`,
+    );
+  }
+  // Anti-drift: source-level guards.
+  const callerTokensSrc = (await import("node:fs")).readFileSync(
+    (await import("node:path")).resolve(process.cwd(), "src/core/caller-tokens.ts"),
+    "utf8",
+  );
+  assert.ok(
+    /spawnSync\(\s*"tasklist"/.test(callerTokensSrc),
+    "v2.18.2 Tier 5: caller-tokens.ts invokes spawnSync('tasklist', ...) for Windows path",
+  );
+  assert.ok(
+    /timeout:\s*500/.test(callerTokensSrc),
+    "v2.18.2 Tier 5: spawnSync timeout cap is 500ms",
+  );
 
   // Restore env.
   if (prevTokensFile === undefined) {

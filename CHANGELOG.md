@@ -9,6 +9,24 @@ standard `v00.00.00`; npm package versions remain SemVer.
 
 _No entries yet._
 
+## [v02.18.02] - 2026-05-06
+
+**Patch — Tier 5 Windows process-tree introspection.** Closes the long-standing forensics gap: pre-v2.18.2 `getParentProcessSnapshot()` returned `parent_exe_basename: null` on Windows because we only had a POSIX `/proc/<ppid>/comm` reader (added in F1 v2.18.0; Windows path explicitly deferred per `project_cross_review_f1_caller_capability_tokens_design.md`). v2.18.2 closes the gap with a defensive `tasklist`-based reader. Coordinated with cross-review-v1 v1.12.2 (parallel ship; same shape, same constraints, same time budget).
+
+### Changed
+
+- `src/core/caller-tokens.ts` — `getParentProcessSnapshot()` now branches on `process.platform === "win32"` and shells out to `tasklist /FI "PID eq <ppid>" /FO CSV /NH` via `child_process.spawnSync` (`encoding: "utf8"`, `timeout: 500`, `windowsHide: true`). Output discriminator: stdout starts with `"` for valid PID (CSV row `"<image>","<pid>",...`), starts with `INFO`/`INFORMAÇÕES:` for "no tasks running" (no leading quote). Parser extracts the first quoted field as the `.exe` basename and applies the same `1 ≤ length < 128` sanity filter as the POSIX path. Best-effort: try/catch swallows ENOENT, timeout, parse failures, all errors — never throws. POSIX path unchanged.
+
+### Added
+
+- **`scripts/smoke.ts`** — sub-test (14) inside `caller_capability_tokens_test` extended with v2.18.2 Tier 5 assertions: shape sanity (`parent_pid` is null or positive integer, `parent_exe_basename` is null or sane string); on Windows with valid `parent_pid`, asserts `parent_exe_basename` is populated; source-level anti-drift guards (`spawnSync("tasklist", ...)`, `timeout: 500`).
+
+### Notes
+
+- Forensics-only: `parent_exe_basename` is metadata captured at session_init in `meta.identity_metadata.parent_exe_basename`. It is NOT used by the F1 token gate (which authenticates via `CROSS_REVIEW_CALLER_TOKEN`) or the v2.17.0 clientInfo cross-check. The field exists for audit trail / forensics review.
+- Time budget: 500ms cap on `spawnSync`. Empirical Windows tasklist latency is 50-200ms on warm cache; the cap is defensive against cold filesystem or denied access.
+- Smoke: build clean, smoke PASS (4 markers all green: per_call_reasoning_effort_overrides_accepted_test, provider_4xx_param_rejection_docs_hint_test, identity_forgery_blocked_test, caller_capability_tokens_test with extended Tier 5 sub-test).
+
 ## [v02.18.01] - 2026-05-05
 
 **Hotfix: closes Dependabot security advisory GHSA-v2v4-37r5-5v8g (medium severity) — `ip-address` XSS in Address6 HTML-emitting methods.** Pre-v2.18.1 the transitive dependency chain `@modelcontextprotocol/sdk@1.29.0 → express-rate-limit@8.4.1 → ip-address@10.1.0` pinned a vulnerable version (also pulled in via `@google/genai@1.52.0 → express-rate-limit@8.4.1`). The exploitability in this codebase is essentially zero (we don't use Address6 HTML-emitting methods, and we don't run the MCP HTTP transport — peers are API-first), but the advisory still surfaces in any `npm audit` and in dependabot. Dependabot's automatic update workflow (#14, run 25409531881) could not resolve the chain because the parent packages don't yet ship a bumped requirement, so dependabot reported "No patched version available for ip-address" and failed.
