@@ -9,6 +9,45 @@ standard `v00.00.00`; npm package versions remain SemVer.
 
 _No entries yet._
 
+## [v02.18.00] - 2026-05-05
+
+**Closes F1 from the v2 backlog: caller capability tokens.** Cryptographic identity proof complementing the v2.17.0 clientInfo gate. Pre-v2.18.0 the v2.17.0 cross-check between declared `caller` and `clientInfo.name` only catches _inconsistent_ self-reports — both fields are declared by the caller. An attacker that lies consistently in both passes the gate. F1 introduces a per-host secret (env var `CROSS_REVIEW_CALLER_TOKEN`), authoritative on match and rejected on mismatch. Coordinated ship with cross-review-v1 v1.11.0 (same scope, same env var names, same operator workflow).
+
+This is a **minor bump** because the public surface adds (a) a new `regenerate_caller_tokens` MCP tool, (b) new fields `verification_method` and `identity_metadata` on the `CallerIdentityResult` shape returned by `verifyCallerIdentity`, (c) a new `caller_tokens` block in `server_info`, and (d) three new env vars (`CROSS_REVIEW_CALLER_TOKEN` per host, `CROSS_REVIEW_TOKENS_FILE` for path override, `CROSS_REVIEW_REQUIRE_TOKEN` for opt-in hard-enforce). Permissive default: hosts without tokens continue to work via the v2.17.0 clientInfo fallback. Operator decisions 2026-05-05: Option C (Hybrid: token enforcement + parent-process forensics breadcrumb), default+customizable token path, ship the regenerate tool now, ship permissive (operator opts into hard-enforce later).
+
+### Added
+
+- New module `src/core/caller-tokens.ts` exposing: `getTokensFilePath`, `generateHostTokens`, `loadHostTokens`, `ensureHostTokens`, `verifyTokenForCaller`, `getParentProcessSnapshot`, `tokensMatch` (constant-time hex comparison via `crypto.timingSafeEqual`), `resolveAgentForToken`, `getEnvToken`, `isHardEnforceMode`. Token shape: 256-bit secret per agent (`crypto.randomBytes(32).toString("hex")`), file mode `0o600` on POSIX, atomic-ish write via `flag: "wx"` for first generation.
+- New MCP tool `regenerate_caller_tokens`: rotates `host-tokens.json` and returns the new map so the operator can copy each per-agent secret into the corresponding MCP host config. Stale tokens start being rejected post-rotation.
+- New env vars:
+  - `CROSS_REVIEW_CALLER_TOKEN`: per-host secret (operator distributes from `host-tokens.json`).
+  - `CROSS_REVIEW_TOKENS_FILE`: optional override for the tokens file path (default `<data_dir>/host-tokens.json`).
+  - `CROSS_REVIEW_REQUIRE_TOKEN=true`: opt-in hard-enforce — refuses any caller without a valid token.
+- New fields on `CallerIdentityResult`:
+  - `verification_method: "token" | "client_info" | "none"`.
+  - `identity_metadata: { parent_pid, parent_exe_basename }` (best-effort forensics; `parent_exe_basename` is null on Windows pending native-API integration in v2.19+).
+- New `caller_tokens` block in `server_info`: `loaded`, `file_path`, `generated_at`, `hard_enforce`, `agents[]` so operators can confirm the gate state without reading the file.
+- New smoke marker `caller_capability_tokens_test` covering: ensureHostTokens generates with mode 0o600 + 5 distinct 64-char hex tokens, loadHostTokens idempotent, tokensMatch constant-time covers equal/different/length-mismatch/null, verifyTokenForCaller match/mismatch/unknown/absent paths, verifyCallerIdentity overlay (token match → method=token; mismatch → throws; absent + permissive → falls back to v2.17.0; absent + hard-enforce → throws), operator caller skips token overlay, generateHostTokens overwrite rotates secrets, getParentProcessSnapshot is best-effort.
+
+### Changed
+
+- `verifyCallerIdentity` em `src/mcp/server.ts`: token check overlays the existing v2.17.0 clientInfo logic. Token present → must resolve to declared caller (else `identity_forgery_blocked: token resolves to X but caller declared Y`). Token absent + hard-enforce → throws `identity_forgery_blocked: CROSS_REVIEW_REQUIRE_TOKEN=true ... but no CROSS_REVIEW_CALLER_TOKEN was provided`. Token absent + permissive (default) → falls back to v2.17.0 clientInfo cross-check unchanged.
+- `main()` em `src/mcp/server.ts` initializes `HOST_TOKENS_RECORD` after `createRuntime()` (loads existing file OR generates with mode `0o600`). One-shot stderr line on first generation publishes the file path + per-agent distribution instructions. Failure to read/write tokens file is non-fatal: server boots, v2.17.0 fallback continues to work for non-migrated hosts.
+- `getCallerCandidatesFromClientInfo` and `verifyCallerIdentity` import path moved into the same module as the tokens overlay (`src/mcp/server.ts` now imports from `src/core/caller-tokens.ts`); public re-exports unchanged.
+
+### Fixed (cross-review trilateral R2 codex catch — 2026-05-05 mid-ship hardening)
+
+R2 codex flagged a defense-in-depth concern: the original v2.18.0 draft had `caller="operator"` skip the token overlay regardless of env state. A malicious AI-agent host could thus pass `caller="operator"` to bypass the token gate (especially relevant when CROSS_REVIEW_REQUIRE_TOKEN=true). Fix: `verifyCallerIdentity` now throws `identity_forgery_blocked` when `caller="operator"` is declared from a host that carries `CROSS_REVIEW_CALLER_TOKEN` — the token binds to a specific AI agent's identity, so declaring operator from such a host is forgery. Genuine human-driven invocations (curl, dashboard, stdio) without a token continue to work; the operator is the gate-setter, intentionally exempt from agent-token enforcement. Smoke `caller_capability_tokens_test` case 12 split into three sub-cases: (12) operator-with-token throws, (12b) operator-without-token works, (12c) operator-in-hard-enforce-without-token still works (gate-setter exemption documented).
+
+Per `feedback_peer_review_rigor.md`, codex's iterative rigor closed a real bypass before ship.
+
+### Operational notes
+
+- **Migration runbook**: (1) start v2.18.0 once on each MCP host (file generates if absent). (2) Operator reads `<data_dir>/host-tokens.json`. (3) Pastes per-agent secret into each of the 6 MCP host configs as `CROSS_REVIEW_CALLER_TOKEN`. (4) Reload all 6 hosts. (5) Validate via `server_info.caller_tokens.loaded === true` and inspect a session response showing `verification_method: "token"`. (6) Optionally flip `CROSS_REVIEW_REQUIRE_TOKEN=true` once all hosts are migrated to enable hard-enforce.
+- **Token rotation**: call `regenerate_caller_tokens` MCP tool. Save the returned map. Redistribute. Reload affected hosts. Stale tokens get rejected with `identity_forgery_blocked: token does not match any known agent`.
+- **Threat model unchanged**: F1 raises the bar for impersonation from "consistently fake clientInfo + caller" to "extract per-host secret from operator filesystem". Workstation compromise still defeats the gate; F1 closes the easier in-protocol attack vector.
+- **Coordinated with cross-review-v1 v1.11.0**: same scope, same env var names. Operators can use the SAME `CROSS_REVIEW_CALLER_TOKEN` value across both runtimes per host (the token files are independent — one in v1's STATE_DIR, one in v2's data_dir — but the operator can choose to use identical secrets for simplicity, or different secrets for compartmentalization).
+
 ## [v02.17.00] - 2026-05-05
 
 **HARD GATE — identity forgery rejection (operator directive 2026-05-05).** Pre-v2.17.0 the `caller` field on tool inputs was trusted unconditionally; v2 did not even capture `clientInfo` from the MCP initialize handshake. An agent (e.g. Codex CLI from the operator's terminal) could pass `caller="claude"` while its MCP client identified itself as "codex", impersonating Claude in tribunal sessions: self-excluding the real Claude from the panel while the impersonator stayed on the panel reviewing its own petition. **Empirical evidence**: cross-review-v2 session `0994cbaf-c270-4eaa-b42b-a0e638b9d1b6` (2026-05-05T05:30:10Z) was created by Codex with `caller=claude` for exactly this purpose.

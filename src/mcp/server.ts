@@ -99,6 +99,38 @@ function textResult(value: unknown, responseFormat = "json") {
 // clientInfo resolves to MULTIPLE known agents (ambiguous host cannot
 // validate the claim).
 export type ClientInfo = { name?: string; version?: string } | undefined;
+
+// v2.18.0 / F1 caller capability tokens — runtime record set at boot.
+// Surfaced to verifyCallerIdentity for the token-overlay step. Module-level
+// state because the token map is loaded once per server boot (file I/O on
+// every call would be wasteful and gives an attacker a TOCTOU window).
+import {
+  ensureHostTokens,
+  generateHostTokens as f1GenerateHostTokens,
+  getParentProcessSnapshot,
+  isHardEnforceMode,
+  verifyTokenForCaller,
+  type HostTokensRecord,
+  type ParentProcessSnapshot,
+} from "../core/caller-tokens.js";
+
+let HOST_TOKENS_RECORD: HostTokensRecord | null = null;
+
+export function getHostTokensRecord(): HostTokensRecord | null {
+  return HOST_TOKENS_RECORD;
+}
+export function setHostTokensRecord(record: HostTokensRecord | null): void {
+  HOST_TOKENS_RECORD = record;
+}
+export function initHostTokensRecord(dataDir: string): void {
+  try {
+    const record = ensureHostTokens(dataDir);
+    HOST_TOKENS_RECORD = record || null;
+  } catch {
+    HOST_TOKENS_RECORD = null;
+  }
+}
+
 export function getCallerCandidatesFromClientInfo(clientInfo: ClientInfo): PeerId[] {
   const name = String(clientInfo?.name || "").toLowerCase();
   if (!name) return [];
@@ -108,38 +140,100 @@ export function getCallerCandidatesFromClientInfo(clientInfo: ClientInfo): PeerI
   }
   return candidates;
 }
+
+export type IdentityVerificationMethod = "token" | "client_info" | "none";
+
+export interface CallerIdentityResult {
+  identity_verified: boolean;
+  verification_method: IdentityVerificationMethod;
+  client_info_name: string | null;
+  identity_metadata: ParentProcessSnapshot;
+}
+
+// v2.18.0 / F1: token verification overlays the v2.17.0 clientInfo gate.
+// Decision tree (in order):
+//   1. caller="operator" → human-driven, non-agent identity. Returns
+//      identity_verified=false, verification_method="none". Token check is
+//      skipped by design — operator is a non-PEER identity, the gate-setter
+//      themselves; AI agents cannot forge "I'm not an AI agent" because:
+//      (a) F1 cross-review-v2 R2 codex catch hardening: if the calling host
+//      carries CROSS_REVIEW_CALLER_TOKEN, it IS an agent host (the token
+//      bind is to a specific AI agent's identity). Declaring caller="operator"
+//      from such a host is identity forgery and throws. Only HOSTS WITHOUT
+//      a token (genuinely human-driven curl/dashboard/stdio) can declare
+//      operator. (b) downstream privilege model: operator caller is never
+//      added to PEERS panels, never participates in tribunal review, never
+//      gets identity_verified=true — verifying code paths that gate on
+//      identity_verified or peer-membership are unaffected by operator
+//      caller. Hard-enforce mode does NOT apply to operator (the
+//      gate-setter is exempt from their own gate by design).
+//   2. v2.17.0 clientInfo cross-check throws → propagate (preserves all
+//      existing forgery rejections).
+//   3. CROSS_REVIEW_CALLER_TOKEN env present → must resolve to declaredCaller
+//      via host-tokens.json; mismatch / unknown / file-missing → throws.
+//      Match → upgrade verification_method to "token".
+//   4. CROSS_REVIEW_CALLER_TOKEN absent + CROSS_REVIEW_REQUIRE_TOKEN=true →
+//      throws (hard-enforce mode opted into by operator).
+//   5. CROSS_REVIEW_CALLER_TOKEN absent + permissive (default) → return
+//      whatever clientInfo cross-check yielded ("client_info" if matched,
+//      "none" if unknown).
+// All paths attach identity_metadata with a best-effort parent-process
+// snapshot for forensics (Option C / Hybrid per design memory).
 export function verifyCallerIdentity(
   declaredCaller: PeerId | "operator",
   clientInfo: ClientInfo,
-): { identity_verified: boolean; client_info_name: string | null } {
+): CallerIdentityResult {
+  const identity_metadata = getParentProcessSnapshot();
   // operator is a non-agent identity; nothing to forge against PEERS list.
+  // BUT: if the calling host carries CROSS_REVIEW_CALLER_TOKEN, it IS an
+  // agent host (token binds to a specific agent's identity). Declaring
+  // operator from such a host is identity forgery — throw.
   if (declaredCaller === "operator") {
+    const presented = process.env.CROSS_REVIEW_CALLER_TOKEN;
+    if (typeof presented === "string" && presented.trim().length > 0) {
+      throw new Error(
+        "identity_forgery_blocked: caller='operator' is not permitted from a host that carries CROSS_REVIEW_CALLER_TOKEN. The token binds to a specific AI agent's identity; declaring operator from such a host is a forgery attempt. Either drop the token from the calling host's env (genuine human-driven invocations should not carry an agent token) or pass the actual agent caller that matches the token.",
+      );
+    }
     return {
       identity_verified: false, // no agent claim made; nothing to verify
+      verification_method: "none",
       client_info_name: clientInfo?.name ?? null,
+      identity_metadata,
     };
   }
   const candidates = getCallerCandidatesFromClientInfo(clientInfo);
-  if (candidates.length === 0) {
-    // legitimate override for unknown hosts (headless orchestrator etc).
-    return {
-      identity_verified: false,
-      client_info_name: clientInfo?.name ?? null,
-    };
-  }
   if (candidates.length >= 2) {
     throw new Error(
       `identity_forgery_blocked: clientInfo.name='${clientInfo?.name}' matches multiple agents (${candidates.join(", ")}); cannot validate declared caller='${declaredCaller}' against an ambiguous client. Pass the request from a host whose clientInfo.name resolves to a single agent.`,
     );
   }
-  if (candidates[0] !== declaredCaller) {
+  if (candidates.length === 1 && candidates[0] !== declaredCaller) {
     throw new Error(
       `identity_forgery_blocked: declared caller='${declaredCaller}' contradicts clientInfo.name='${clientInfo?.name}' which resolves to '${candidates[0]}'. An agent cannot self-declare a different identity than its MCP host (operator directive 2026-05-05). If this is a legitimate cross-host setup, ensure clientInfo.name does not contain a different agent's name as substring.`,
     );
   }
+
+  let verification_method: IdentityVerificationMethod =
+    candidates.length === 1 ? "client_info" : "none";
+  let identity_verified = candidates.length === 1;
+
+  // Token overlay (v2.18.0 F1).
+  const tokenResult = verifyTokenForCaller(declaredCaller, HOST_TOKENS_RECORD);
+  if (tokenResult.verified) {
+    verification_method = "token";
+    identity_verified = true;
+  } else if (isHardEnforceMode()) {
+    throw new Error(
+      "identity_forgery_blocked: CROSS_REVIEW_REQUIRE_TOKEN=true is set but no CROSS_REVIEW_CALLER_TOKEN was provided in this call's environment. Either remove the hard-enforce flag or distribute host-tokens.json to the calling host's MCP env.",
+    );
+  }
+
   return {
-    identity_verified: true,
+    identity_verified,
+    verification_method,
     client_info_name: clientInfo?.name ?? null,
+    identity_metadata,
   };
 }
 
@@ -297,12 +391,29 @@ const TOOL_NAMES = [
   "session_judgment_precision_report",
   "contest_verdict",
   "escalate_to_operator",
+  "regenerate_caller_tokens",
   "session_sweep",
   "session_finalize",
 ] as const;
 
 export async function main(): Promise<void> {
   const runtime = createRuntime();
+  // v2.18.0 / F1: initialize the per-host token map (load existing OR
+  // generate with mode 0o600). Failure is non-fatal — the v2.17.0
+  // clientInfo gate still works for non-migrated hosts. One-shot stderr
+  // line on first generation publishes the file path so the operator can
+  // distribute the per-agent secrets.
+  initHostTokensRecord(runtime.config.data_dir);
+  const tokensRecord = getHostTokensRecord();
+  if (tokensRecord && process.env.CROSS_REVIEW_V2_TEST_QUIET !== "1") {
+    process.stderr.write(
+      `[cross-review-v2] F1 caller capability tokens loaded from ${tokensRecord.filePath} (generated_at=${tokensRecord.generated_at || "unknown"}; distribute the per-agent secrets to each MCP host config as CROSS_REVIEW_CALLER_TOKEN to enable verification_method=token; v2.17.0 clientInfo gate remains active as fallback).\n`,
+    );
+  } else if (!tokensRecord && process.env.CROSS_REVIEW_V2_TEST_QUIET !== "1") {
+    process.stderr.write(
+      `[cross-review-v2] F1 caller capability tokens unavailable (failed to load or generate host-tokens.json); the v2.17.0 clientInfo identity gate remains active. Set CROSS_REVIEW_TOKENS_FILE to a writable path or fix data_dir permissions to enable token verification.\n`,
+    );
+  }
   const server = new McpServer({
     name: "cross-review-v2",
     version: VERSION,
@@ -378,6 +489,18 @@ export async function main(): Promise<void> {
           // server_info see the resolved enabled/disabled state of each peer.
           peer_enabled: runtime.config.peer_enabled,
           peers_enabled_count: Object.values(runtime.config.peer_enabled).filter(Boolean).length,
+          // v2.18.0 / F1: caller capability tokens status. Surfaces (a)
+          // whether host-tokens.json is loaded (operators confirm gate is
+          // armed without reading the file), (b) the file path so the
+          // operator can locate secrets to distribute, (c) hard-enforce
+          // mode flag, (d) generated_at timestamp for rotation audit.
+          caller_tokens: {
+            loaded: getHostTokensRecord() !== null,
+            file_path: getHostTokensRecord()?.filePath ?? null,
+            generated_at: getHostTokensRecord()?.generated_at ?? null,
+            hard_enforce: isHardEnforceMode(),
+            agents: getHostTokensRecord() ? Object.keys(getHostTokensRecord()?.map ?? {}) : [],
+          },
           codeql_policy: "Default Setup on GitHub; no advanced workflow committed.",
           secrets_policy: "API keys are read from Windows environment variables only.",
         },
@@ -1244,6 +1367,51 @@ export async function main(): Promise<void> {
           new_initial_draft,
           new_caller,
         }),
+        response_format,
+      );
+    },
+  );
+
+  server.registerTool(
+    "regenerate_caller_tokens",
+    {
+      title: "Regenerate Caller Tokens (F1)",
+      description:
+        "v2.18.0 / F1 (caller capability tokens). Rotate the per-host secret tokens used by the F1 identity gate. OVERWRITES the existing host-tokens.json file (default location: <data_dir>/host-tokens.json; override via CROSS_REVIEW_TOKENS_FILE env var) with freshly generated 256-bit hex secrets — one per agent (codex, claude, gemini, deepseek, grok). Returns the new map so the operator can copy each per-agent secret into the corresponding MCP host config as CROSS_REVIEW_CALLER_TOKEN. AFTER calling this tool, every MCP host carrying a stale token will start being rejected with identity_forgery_blocked: token does not match any known agent. The operator MUST redistribute the secrets and reload the affected hosts. Use cases: (a) initial deployment after first-boot generation; (b) suspected token leak; (c) periodic rotation. The tool has no input parameters and no auth gate — local filesystem access already implies the ability to read or rewrite host-tokens.json directly, so the MCP surface adds no new exposure.",
+      inputSchema: z.object({ response_format: ResponseFormatSchema }).strict(),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ response_format }) => {
+      const generated = f1GenerateHostTokens(runtime.config.data_dir, {
+        overwrite: true,
+      });
+      if (!generated) {
+        throw new Error(
+          "regenerate_caller_tokens: failed to write host-tokens.json (no record returned); check data_dir / CROSS_REVIEW_TOKENS_FILE permissions.",
+        );
+      }
+      setHostTokensRecord({
+        filePath: generated.filePath,
+        map: generated.map,
+        generated_at: generated.generated_at,
+      });
+      return textResult(
+        {
+          ok: true,
+          file_path: generated.filePath,
+          generated_at: generated.generated_at,
+          tokens: generated.map,
+          next_steps: [
+            "Copy each per-agent secret into the corresponding MCP host config as CROSS_REVIEW_CALLER_TOKEN.",
+            "Reload the affected MCP hosts so the new env value is picked up.",
+            "Stale tokens will start being rejected with identity_forgery_blocked: token does not match any known agent.",
+          ],
+        },
         response_format,
       );
     },

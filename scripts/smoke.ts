@@ -27,6 +27,7 @@ import {
   SessionIdSchema,
   getCallerCandidatesFromClientInfo,
   pruneCompletedJobs,
+  setHostTokensRecord,
   verifyCallerIdentity,
 } from "../src/mcp/server.js";
 import type { JobStatus } from "../src/mcp/server.js";
@@ -4005,6 +4006,190 @@ assert.equal(Object.hasOwn(metrics.decision_quality, "undefined"), false);
   assert.deepEqual(cands.sort(), ["claude", "codex"]);
 
   console.log("[smoke] identity_forgery_blocked_test: PASS");
+}
+
+// v2.18.0 F1 caller capability tokens — module unit + verifyCallerIdentity
+// overlay coverage. Isolates writes to mkdtempSync via CROSS_REVIEW_TOKENS_FILE
+// so the smoke run never touches the operator's real data_dir.
+{
+  const f1 = await import("../src/core/caller-tokens.js");
+  const tmpRoot = await import("node:fs").then((fs) =>
+    fs.mkdtempSync(path.join(os.tmpdir(), "v2180-tokens-")),
+  );
+  const isolatedPath = path.join(tmpRoot, "host-tokens.json");
+  const prevTokensFile = process.env.CROSS_REVIEW_TOKENS_FILE;
+  const prevReqToken = process.env.CROSS_REVIEW_REQUIRE_TOKEN;
+  const prevCallerToken = process.env.CROSS_REVIEW_CALLER_TOKEN;
+  process.env.CROSS_REVIEW_TOKENS_FILE = isolatedPath;
+  delete process.env.CROSS_REVIEW_REQUIRE_TOKEN;
+  delete process.env.CROSS_REVIEW_CALLER_TOKEN;
+
+  // (1) ensureHostTokens generates with mode 0o600 (POSIX); tokens are
+  // 5 distinct 64-char lowercase hex strings.
+  const r1 = f1.ensureHostTokens(tmpRoot);
+  assert.ok(r1?.map, "ensureHostTokens returns a record");
+  const map = r1?.map;
+  assert.ok(map, "tokens map present");
+  if (!map) throw new Error("tokens map missing");
+  for (const agent of ["codex", "claude", "gemini", "deepseek", "grok"] as const) {
+    assert.match(map[agent], /^[0-9a-f]{64}$/, `${agent} token is 64-char lowercase hex`);
+  }
+  const distinct = new Set(Object.values(map));
+  assert.equal(distinct.size, 5, "all 5 tokens are distinct");
+
+  // (2) loadHostTokens is idempotent — re-read returns the same map.
+  const r2 = f1.loadHostTokens(tmpRoot);
+  assert.deepEqual(r2?.map, r1?.map, "loadHostTokens is idempotent");
+
+  // (3) tokensMatch (constant-time hex comparison) — equal/different/length-mismatch/null.
+  assert.equal(f1.tokensMatch(map.claude, map.claude), true);
+  assert.equal(f1.tokensMatch(map.claude, map.codex), false);
+  assert.equal(f1.tokensMatch("aa", map.claude), false);
+  assert.equal(f1.tokensMatch(null, map.claude), false);
+
+  // (4) verifyTokenForCaller: matching token → method=token, verified=true.
+  process.env.CROSS_REVIEW_CALLER_TOKEN = map.claude;
+  const v1 = f1.verifyTokenForCaller("claude", r1);
+  assert.equal(v1.verified, true);
+  assert.equal(v1.method, "token");
+
+  // (5) Token mismatch (claude token but caller declared codex) → throws.
+  let mismatchThrown = false;
+  try {
+    f1.verifyTokenForCaller("codex", r1);
+  } catch (err) {
+    mismatchThrown = /resolves to agent='claude' but caller declared='codex'/.test(
+      (err as Error).message,
+    );
+  }
+  assert.ok(mismatchThrown, "v2.18.0 F1: token agent mismatch throws");
+
+  // (6) Unknown token → throws.
+  process.env.CROSS_REVIEW_CALLER_TOKEN = "deadbeef".repeat(8);
+  let unknownThrown = false;
+  try {
+    f1.verifyTokenForCaller("claude", r1);
+  } catch (err) {
+    unknownThrown = /token does not match any known agent/i.test((err as Error).message);
+  }
+  assert.ok(unknownThrown, "v2.18.0 F1: unknown token throws");
+
+  // (7) No env token → method=absent (caller decides fallback).
+  delete process.env.CROSS_REVIEW_CALLER_TOKEN;
+  const v2 = f1.verifyTokenForCaller("claude", r1);
+  assert.equal(v2.verified, false);
+  assert.equal(v2.method, "absent");
+
+  // (8) verifyCallerIdentity overlay: token match → verification_method=token.
+  setHostTokensRecord(r1);
+  process.env.CROSS_REVIEW_CALLER_TOKEN = map.claude;
+  const idV = verifyCallerIdentity("claude", { name: "claude-code" });
+  assert.equal(idV.verification_method, "token");
+  assert.equal(idV.identity_verified, true);
+  assert.ok(idV.identity_metadata, "identity_metadata always present");
+
+  // (9) verifyCallerIdentity overlay: token mismatch → throws.
+  let overlayMismatchThrown = false;
+  try {
+    verifyCallerIdentity("codex", { name: "codex-cli" });
+  } catch (err) {
+    overlayMismatchThrown = /identity_forgery_blocked/.test((err as Error).message);
+  }
+  assert.ok(
+    overlayMismatchThrown,
+    "v2.18.0 F1: verifyCallerIdentity throws when token belongs to a different agent",
+  );
+
+  // (10) verifyCallerIdentity overlay: token absent + permissive → falls back to v2.17.0.
+  delete process.env.CROSS_REVIEW_CALLER_TOKEN;
+  const idFallback = verifyCallerIdentity("claude", { name: "claude-code" });
+  assert.equal(idFallback.verification_method, "client_info");
+  assert.equal(idFallback.identity_verified, true);
+
+  // (11) verifyCallerIdentity overlay: token absent + hard-enforce → throws.
+  process.env.CROSS_REVIEW_REQUIRE_TOKEN = "true";
+  let hardEnforceThrown = false;
+  try {
+    verifyCallerIdentity("claude", { name: "claude-code" });
+  } catch (err) {
+    hardEnforceThrown = /CROSS_REVIEW_REQUIRE_TOKEN=true/.test((err as Error).message);
+  }
+  assert.ok(hardEnforceThrown, "v2.18.0 F1: hard-enforce mode rejects token-absent calls");
+  delete process.env.CROSS_REVIEW_REQUIRE_TOKEN;
+
+  // (12) operator caller — R2 codex catch hardening: a host carrying
+  // CROSS_REVIEW_CALLER_TOKEN cannot declare caller="operator" (the token
+  // binds to a specific AI agent identity; declaring operator from such
+  // a host is forgery). Throws.
+  process.env.CROSS_REVIEW_CALLER_TOKEN = "deadbeef".repeat(8);
+  let operatorWithTokenThrown = false;
+  try {
+    verifyCallerIdentity("operator", { name: "claude-code" });
+  } catch (err) {
+    operatorWithTokenThrown =
+      /caller='operator' is not permitted from a host that carries CROSS_REVIEW_CALLER_TOKEN/.test(
+        (err as Error).message,
+      );
+  }
+  assert.ok(
+    operatorWithTokenThrown,
+    "v2.18.0 F1: caller='operator' from a token-bearing host MUST throw (R2 codex catch hardening)",
+  );
+
+  // (12b) operator caller without token → OK (genuine human-driven
+  // invocation; operator is the gate-setter, exempt from agent-token
+  // enforcement by design).
+  delete process.env.CROSS_REVIEW_CALLER_TOKEN;
+  const opIdent = verifyCallerIdentity("operator", { name: "claude-code" });
+  assert.equal(opIdent.verification_method, "none");
+  assert.equal(opIdent.identity_verified, false);
+
+  // (12c) operator caller in hard-enforce mode WITHOUT token → OK
+  // (operator is the gate-setter; hard-enforce applies only to agent
+  // identities, not to the human-driven operator caller).
+  process.env.CROSS_REVIEW_REQUIRE_TOKEN = "true";
+  const opHardEnforce = verifyCallerIdentity("operator", { name: "claude-code" });
+  assert.equal(opHardEnforce.verification_method, "none");
+  assert.equal(opHardEnforce.identity_verified, false);
+  delete process.env.CROSS_REVIEW_REQUIRE_TOKEN;
+
+  // (13) generateHostTokens overwrite rotates secrets — file content differs.
+  delete process.env.CROSS_REVIEW_CALLER_TOKEN;
+  const beforeRotate = (await import("node:fs")).readFileSync(isolatedPath, "utf8");
+  const r3 = f1.generateHostTokens(tmpRoot, { overwrite: true });
+  const afterRotate = (await import("node:fs")).readFileSync(isolatedPath, "utf8");
+  assert.notEqual(beforeRotate, afterRotate, "rotation changes file content");
+  assert.notEqual(r3?.map.claude, r1?.map.claude, "claude token rotates");
+
+  // (14) getParentProcessSnapshot is best-effort, never throws.
+  const snap = f1.getParentProcessSnapshot();
+  assert.ok(snap !== null && typeof snap === "object");
+  assert.ok("parent_pid" in snap && "parent_exe_basename" in snap);
+
+  // Restore env.
+  if (prevTokensFile === undefined) {
+    delete process.env.CROSS_REVIEW_TOKENS_FILE;
+  } else {
+    process.env.CROSS_REVIEW_TOKENS_FILE = prevTokensFile;
+  }
+  if (prevReqToken === undefined) {
+    delete process.env.CROSS_REVIEW_REQUIRE_TOKEN;
+  } else {
+    process.env.CROSS_REVIEW_REQUIRE_TOKEN = prevReqToken;
+  }
+  if (prevCallerToken === undefined) {
+    delete process.env.CROSS_REVIEW_CALLER_TOKEN;
+  } else {
+    process.env.CROSS_REVIEW_CALLER_TOKEN = prevCallerToken;
+  }
+  setHostTokensRecord(null);
+  try {
+    (await import("node:fs")).rmSync(tmpRoot, { recursive: true, force: true });
+  } catch {
+    /* best-effort */
+  }
+
+  console.log("[smoke] caller_capability_tokens_test: PASS");
 }
 
 // v2.6.1 NOTE: smoke coverage for `peer.fallback.budget_blocked` and
