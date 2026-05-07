@@ -7,8 +7,8 @@ standard `v00.00.00`; npm package versions remain SemVer.
 
 ## [Unreleased]
 
-
 ### Alterado
+
 - site/index.html deixou de carregar o widget/SDK SumUp e passou a encaminhar apoios para https://www.lcv.dev/sponsor?project=cross-review-v2, com backend dedicado sponsor-motor via Mercado Pago Checkout Pro.
 
 ## [v02.18.02] - 2026-05-06
