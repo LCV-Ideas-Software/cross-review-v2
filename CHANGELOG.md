@@ -11,6 +11,24 @@ standard `v00.00.00`; npm package versions remain SemVer.
 
 - site/index.html deixou de carregar o widget/SDK SumUp e passou a encaminhar apoios para https://www.lcv.dev/sponsor?project=cross-review-v2, com backend dedicado sponsor-motor via Mercado Pago Checkout Pro.
 
+## [v02.18.03] - 2026-05-07
+
+**Patch — Gemini default pin bump `gemini-3.1-pro-preview` → `gemini-2.5-pro` (operator preference 2026-05-07; coordinated with cross-review-v1 v1.12.4).** Earlier today the 7 LCV-workspace MCP host configs flipped `CROSS_REVIEW_GEMINI_MODEL` env-override to `gemini-2.5-pro` (operator directive: `gemini-2.5-pro` carries 1k requests/day quota under Google One AI Ultra vs `gemini-3.1-pro-preview`'s 250 requests/day). v2.18.3 aligns the source-of-truth defaults so a fresh install without env-override picks the same model. Workspace policy 2026-05-07: only `gemini-*-pro` variants ≥ 2.5 are permitted — no `*-flash` and no models below 2.5.
+
+### Changed
+
+- **`src/core/config.ts`** — `VERSION` 2.18.2 → 2.18.3; `RELEASE_DATE` 2026-05-06 → 2026-05-07; `models.gemini` default fallback `"gemini-3.1-pro-preview"` → `"gemini-2.5-pro"` (env-override `CROSS_REVIEW_GEMINI_MODEL` continues to take priority when set).
+- **`src/peers/model-selection.ts`** — gemini priority list reordered from `["gemini-3.1-pro-preview", "gemini-2.5-pro"]` to `["gemini-2.5-pro", "gemini-3.1-pro-preview"]`. 3.1-pro-preview retained as fallback for hosts that explicitly select it.
+- **`scripts/smoke.ts`** line 225 — `currentOfficialModel` iterator entry `"gemini-3.1-pro-preview"` → `"gemini-2.5-pro"` to align with the new default.
+- **`docs/api-keys.md`** — `CROSS_REVIEW_GEMINI_MODEL` env-var example flipped to `gemini-2.5-pro`.
+- **`docs/model-selection.md`** — priority block flipped to `gemini-2.5-pro > gemini-3.1-pro-preview`; added paragraph explaining workspace policy (`gemini-*-pro` ≥ 2.5 only; no `*-flash`).
+
+### Notas técnicas
+
+- Lint/typecheck/format clean. Smoke 6/6 PASS unchanged (smoke fixture's `currentOfficialModel` array updated to reference the new canonical pin — `scripts/smoke.ts:225` flipped `gemini-3.1-pro-preview` → `gemini-2.5-pro` — but the 6-test suite assertions and shape are unchanged from v2.18.2; capability_snapshot probe in real sessions returns `model: "gemini-2.5-pro"` from env-override on the 7 LCV hosts).
+- No public surface change beyond default model ID. Hosts using `CROSS_REVIEW_GEMINI_MODEL` env-override (default for the 7 LCV-workspace MCP hosts since 2026-05-07) see no behavior change at all.
+- Coordinated with `cross-review-v1` v1.12.4 (parallel ship; same gemini default flip in `peer-spawn.js` `GEMINI_MODEL` constant + `top-models.json` `gemini.id`).
+
 ## [v02.18.02] - 2026-05-06
 
 **Patch — Tier 5 Windows process-tree introspection.** Closes the long-standing forensics gap: pre-v2.18.2 `getParentProcessSnapshot()` returned `parent_exe_basename: null` on Windows because we only had a POSIX `/proc/<ppid>/comm` reader (added in F1 v2.18.0; Windows path explicitly deferred per `project_cross_review_f1_caller_capability_tokens_design.md`). v2.18.2 closes the gap with a defensive `tasklist`-based reader. Coordinated with cross-review-v1 v1.12.2 (parallel ship; same shape, same constraints, same time budget).

@@ -23,7 +23,7 @@ const PRIORITY: Record<PeerId, string[]> = {
     "gpt-5",
   ],
   claude: ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"],
-  gemini: ["gemini-3.1-pro-preview", "gemini-2.5-pro"],
+  gemini: ["gemini-2.5-pro", "gemini-3.1-pro-preview"],
   deepseek: ["deepseek-v4-pro", "deepseek-v4-flash"],
   // v2.16.0 official-doc refresh (2026-05-05): xAI's reasoning docs
   // distinguish automatic-reasoning Grok models from the explicit

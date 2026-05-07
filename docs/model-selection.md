@@ -36,10 +36,10 @@ Haiku is intentionally excluded because the cross-review role requires advanced 
 Google/Gemini:
 
 ```text
-gemini-3.1-pro-preview > gemini-2.5-pro
+gemini-2.5-pro > gemini-3.1-pro-preview
 ```
 
-`gemini-3-pro-preview` is intentionally excluded from the active fallback path because preview model deprecation is tracked through official Gemini release notes and this project avoids soon-to-deprecate intermediate previews when a newer advanced model is available.
+Operator preference 2026-05-07: `gemini-2.5-pro` is the runtime default because under Google One AI Ultra subscription it carries 1k requests/day vs `gemini-3.1-pro-preview`'s 250 requests/day; `gemini-3.1-pro-preview` remains in the priority list as a fallback. Workspace policy (operator directive 2026-05-07): only `gemini-*-pro` variants ≥ 2.5 are permitted — no `*-flash` variants and no models below 2.5 (those are deprecated). `gemini-3-pro-preview` is intentionally excluded from the active fallback path because preview model deprecation is tracked through official Gemini release notes and this project avoids soon-to-deprecate intermediate previews when a newer advanced model is available.
 
 DeepSeek:
 

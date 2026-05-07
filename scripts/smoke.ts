@@ -222,7 +222,7 @@ for (const deprecatedOrWeakModel of [
 for (const currentOfficialModel of [
   "gpt-5.5",
   "claude-opus-4-7",
-  "gemini-3.1-pro-preview",
+  "gemini-2.5-pro",
   "deepseek-v4-pro",
   "grok-4.20-multi-agent",
   "grok-4.3",

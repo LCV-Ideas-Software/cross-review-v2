@@ -18,8 +18,8 @@ function expandHome(rawPath: string): string {
   return rawPath;
 }
 
-export const VERSION = "2.18.2";
-export const RELEASE_DATE = "2026-05-06";
+export const VERSION = "2.18.3";
+export const RELEASE_DATE = "2026-05-07";
 export const DEFAULT_MAX_OUTPUT_TOKENS = 20_000;
 const COST_RATE_ENV_PREFIX: Record<PeerId, string> = {
   codex: "CROSS_REVIEW_OPENAI",
@@ -186,7 +186,7 @@ export function loadConfig(): AppConfig {
     models: {
       codex: envValue("CROSS_REVIEW_OPENAI_MODEL") || "gpt-5.5",
       claude: envValue("CROSS_REVIEW_ANTHROPIC_MODEL") || "claude-opus-4-7",
-      gemini: envValue("CROSS_REVIEW_GEMINI_MODEL") || "gemini-3.1-pro-preview",
+      gemini: envValue("CROSS_REVIEW_GEMINI_MODEL") || "gemini-2.5-pro",
       deepseek: envValue("CROSS_REVIEW_DEEPSEEK_MODEL") || "deepseek-v4-pro",
       // v2.16.0 clarification: operator may choose `grok-4-latest`,
       // `grok-4.3`, `grok-4.20`, or `grok-4.20-reasoning` (xAI automatic
